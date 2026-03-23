@@ -560,8 +560,9 @@
 }
 
 .mobile-menu-button {
-  width: 42px;
-  min-width: 42px;
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
   padding: 0;
   display: inline-flex;
   align-items: center;
@@ -569,8 +570,19 @@
 }
 
 .hamburger {
-  font-size: 1.15rem;
-  line-height: 1;
+  display: inline-flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 5px;
+  width: 20px;
+}
+
+.hamburger-line {
+  display: block;
+  width: 20px;
+  height: 2.5px;
+  border-radius: 999px;
+  background: currentColor;
 }
 
 @media (max-width: 1024px) {
@@ -619,7 +631,7 @@
     gap: 8px;
   }
 
-  .mobile-reader-toolbar span {
+  .mobile-reader-toolbar .mobile-toolbar-title {
     display: none;
   }
 

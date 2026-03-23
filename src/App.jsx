@@ -505,6 +505,8 @@ function App() {
       return
     }
 
+    setActiveView('dashboard')
+    setIsSectionsPanelOpen(false)
     setError('')
     setRepoStatus('Checking repository...')
     setIsPullingRepo(true)
@@ -863,9 +865,13 @@ function App() {
               onClick={() => setIsSectionsPanelOpen(true)}
               aria-label={activeView === 'dashboard' ? 'Open sections menu' : 'Open sidebar menu'}
             >
-              <span className="hamburger" aria-hidden="true">☰</span>
+              <span className="hamburger" aria-hidden="true">
+                <span className="hamburger-line" />
+                <span className="hamburger-line" />
+                <span className="hamburger-line" />
+              </span>
             </button>
-            <span>
+            <span className="mobile-toolbar-title">
               {activeView === 'dashboard'
                 ? selectedDoc
                   ? selectedDoc.title
