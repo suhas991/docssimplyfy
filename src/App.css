@@ -1,5 +1,5 @@
 .app-shell {
-  min-height: 100vh;
+  height: 100vh;
   display: grid;
   grid-template-columns: 280px 1fr;
   background: var(--panel-bg);
@@ -7,7 +7,7 @@
   border-radius: 18px;
   overflow: hidden;
   box-shadow: 0 24px 60px rgba(24, 27, 39, 0.12);
-  margin: 16px;
+  margin: 0;
   position: relative;
 }
 
@@ -16,6 +16,8 @@
   border-right: 1px solid var(--border);
   padding: 24px 18px;
   overflow-y: auto;
+  height: 100%;
+  min-height: 0;
 }
 
 .sidebar-brand {
@@ -161,9 +163,10 @@
 }
 
 .main-shell {
-  display: grid;
-  grid-template-rows: auto auto 1fr;
-  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
   background:
     radial-gradient(1100px 460px at 20% -10%, rgba(252, 223, 182, 0.45), transparent 55%),
     radial-gradient(1200px 600px at 100% 0%, rgba(169, 207, 227, 0.4), transparent 56%),
@@ -224,7 +227,12 @@
 
 .document-panel {
   padding: 22px;
-  overflow-y: auto;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  min-height: 0;
 }
 
 .sync-card,
@@ -233,11 +241,15 @@
 .settings-card,
 .help-card {
   max-width: 920px;
+  width: 100%;
   margin: 0 auto;
   background: rgba(255, 255, 255, 0.75);
   border: 1px solid var(--border);
   border-radius: 16px;
   box-shadow: 0 8px 24px rgba(22, 28, 45, 0.08);
+  max-height: 90vh;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .sync-card {
@@ -536,9 +548,12 @@
 }
 
 .empty-state {
-  margin-top: 16px;
   padding: clamp(26px, 5vw, 48px);
   text-align: center;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
 }
 
 .empty-state h2 {
@@ -591,6 +606,15 @@
     border: none;
     border-radius: 0;
     grid-template-columns: 1fr;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .sidebar {
+    flex: 1;
+    height: auto;
+    min-height: 0;
   }
 
   .sidebar {
@@ -608,6 +632,18 @@
     transform: translateX(0);
   }
 
+  .sidebar-nav-block {
+    display: none;
+  }
+
+  .sidebar-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    justify-content: space-between;
+    margin-bottom: 12px;
+  }
+
   .mobile-close-sections {
     display: inline-flex;
     border: 1px solid var(--button-border);
@@ -618,6 +654,16 @@
     font-size: 0.78rem;
     font-weight: 600;
     cursor: pointer;
+  }
+
+  .main-shell {
+    flex: 1;
+    padding-bottom: 60px;
+    height: auto;
+    min-height: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
   }
 
   .main-topbar {
@@ -632,11 +678,21 @@
   }
 
   .mobile-reader-toolbar .mobile-toolbar-title {
-    display: none;
+    display: block;
+    font-weight: 600;
+    font-size: 0.95rem;
+    flex: 1;
+  }
+
+  .mobile-menu-button {
+    display: inline-flex;
   }
 
   .document-panel {
     padding: 12px;
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
   }
 
   .sync-card,
@@ -645,9 +701,15 @@
   .settings-card,
   .help-card {
     border-radius: 12px;
+    overflow-y: auto;
+    max-height: 100%;
   }
 
   .sync-card-header {
+    flex-direction: column;
+  }
+
+  .settings-card-header {
     flex-direction: column;
   }
 
@@ -658,6 +720,7 @@
 
   .auth-note {
     text-align: left;
+    font-size: 0.8rem;
   }
 
   .repo-pull-row {
@@ -677,5 +740,42 @@
     background: rgba(17, 24, 39, 0.35);
     border: none;
     z-index: 30;
+  }
+
+  .mobile-bottom-nav {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 60px;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    background: #ffffff;
+    border-top: 1px solid var(--border);
+    z-index: 50;
+    box-shadow: 0 -2px 12px rgba(24, 27, 39, 0.1);
+    overflow: hidden;
+  }
+
+  .mobile-bottom-link {
+    border: none;
+    border-top: 3px solid transparent;
+    background: transparent;
+    color: var(--text-primary);
+    font-size: 0.74rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .mobile-bottom-link-active {
+    color: var(--button-primary-bg);
+    border-top-color: var(--button-primary-bg);
+    background: rgba(15, 111, 149, 0.04);
+  }
+}
+
+@media (min-width: 1025px) {
+  .mobile-bottom-nav {
+    display: none;
   }
 }

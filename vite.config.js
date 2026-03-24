@@ -5,13 +5,15 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   server: {
-    host: 'localhost',
+    host: true,
     port: 5173,
     strictPort: true,
-    hmr: {
-      host: 'localhost',
-      port: 5173,
-      protocol: 'ws',
+    proxy: {
+      '/github-api': {
+        target: 'https://api.github.com',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/github-api/, ''),
+      },
     },
   },
 })

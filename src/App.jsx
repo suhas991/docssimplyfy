@@ -81,7 +81,12 @@ function parseGitHubRepo(input) {
     return null
   }
 
-  const normalized = trimmed.replace(/^git@github\.com:/, 'https://github.com/')
+  const withoutCommand = trimmed.replace(/^git\s+clone\s+/i, '')
+  const normalized = withoutCommand
+    .replace(/^git@github\.com:/i, 'https://github.com/')
+    .replace(/^git:\/\/github\.com\//i, 'https://github.com/')
+    .replace(/^www\.github\.com\//i, 'https://github.com/')
+    .replace(/^github\.com\//i, 'https://github.com/')
   let url
 
   try {
@@ -174,30 +179,65 @@ function mergeDocsIntoLibrary(previous, docs) {
     .sort(sectionSort)
 }
 
-function toRawGitHubPath(path) {
+function toGitHubApiPath(path, useProxy = true) {
+  if (import.meta.env.DEV && useProxy) {
+    return `/github-api${path}`
+  }
+
+  return `https://api.github.com${path}`
+}
+
+function encodeRepoPath(path) {
   return path
     .split('/')
     .map((part) => encodeURIComponent(part))
     .join('/')
 }
 
-async function githubRequest(path, token, options = {}) {
-  const response = await fetch(`https://api.github.com${path}`, {
-    ...options,
-    headers: {
-      Accept: 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(options.headers || {}),
-    },
-  })
+function decodeGitHubContent(base64Content) {
+  const sanitized = base64Content.replace(/\n/g, '')
+  const bytes = Uint8Array.from(atob(sanitized), (char) => char.charCodeAt(0))
+  return new TextDecoder('utf-8').decode(bytes)
+}
 
-  if (!response.ok) {
-    const errorText = await response.text()
-    throw new Error(errorText || `GitHub API request failed for ${path}`)
+async function githubRequest(path, token, options = {}) {
+  let lastError = null
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const useProxy = attempt === 0
+    const url = toGitHubApiPath(path, useProxy)
+
+    try {
+      const response = await fetch(url, {
+        ...options,
+        headers: {
+          Accept: 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          ...(options.headers || {}),
+        },
+      })
+
+      if (!response.ok) {
+        const errorText = await response.text()
+        const apiError = `GitHub API error: ${response.status} ${response.statusText}. ${errorText}`
+        if (attempt === 1 || !import.meta.env.DEV) {
+          throw new Error(apiError)
+        }
+        lastError = apiError
+        continue
+      }
+
+      return response.json()
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err)
+      if (attempt === 1 || !import.meta.env.DEV) {
+        throw new Error(`${useProxy ? '[Proxy]' : '[Direct]'} ${lastError}`)
+      }
+    }
   }
 
-  return response.json()
+  throw new Error(lastError || 'GitHub API request failed')
 }
 
 function explainGitHubError(error, fallbackMessage) {
@@ -205,16 +245,38 @@ function explainGitHubError(error, fallbackMessage) {
     return fallbackMessage
   }
 
-  if (error.message.includes('Bad credentials')) {
+  const msg = error.message
+  const lowerMessage = msg.toLowerCase()
+  const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false
+
+  console.error('[GitHub Error]', msg)
+
+  if (isOffline) {
+    return 'Network is offline on this device. Reconnect internet and retry.'
+  }
+
+  if (lowerMessage.includes('internet_disconnected') || lowerMessage.includes('failed to fetch')) {
+    return `Network issue: ${msg}. Check if you have internet and GitHub is reachable.`
+  }
+
+  if (lowerMessage.includes('networkerror')) {
+    return 'Network connection failed. Check WiFi/mobile data and try again.'
+  }
+
+  if (msg.includes('Bad credentials')) {
     return 'GitHub token is invalid. Create a new token and try again.'
   }
 
-  if (error.message.includes('rate limit')) {
-    return 'GitHub rate limit reached. Try again later or use a token with higher limits.'
+  if (msg.includes('rate limit')) {
+    return 'GitHub rate limit reached. Try again in an hour or use a token with higher limits.'
   }
 
-  if (error.message.includes('Not Found')) {
-    return 'Repository was not found, or your token does not have access to it.'
+  if (msg.includes('Not Found')) {
+    return 'Repository not found or you do not have access to it.'
+  }
+
+  if (msg.includes('[Proxy]') && msg.includes('[Direct]')) {
+    return `Could not reach GitHub. Error: ${msg}. Ensure GitHub API is accessible.`
   }
 
   return fallbackMessage
@@ -242,15 +304,17 @@ async function fetchMarkdownDocsFromRepo({ owner, repo, token }) {
 
   const docs = await Promise.all(
     limitedEntries.map(async (entry) => {
-      const rawPath = toRawGitHubPath(entry.path)
-      const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${encodeURIComponent(defaultBranch)}/${rawPath}`
-      const fileRes = await fetch(rawUrl)
+      const encodedPath = encodeRepoPath(entry.path)
+      const fileData = await githubRequest(
+        `/repos/${owner}/${repo}/contents/${encodedPath}?ref=${encodeURIComponent(defaultBranch)}`,
+        token,
+      )
 
-      if (!fileRes.ok) {
+      if (!fileData?.content) {
         throw new Error(`Failed to download ${entry.path}`)
       }
 
-      const content = await fileRes.text()
+      const content = decodeGitHubContent(fileData.content)
       return {
         id: `${toSlug(entry.path)}-${crypto.randomUUID()}`,
         title: getTitleFromPath(entry.path),
@@ -366,6 +430,10 @@ function App() {
 
   useEffect(() => {
     localStorage.setItem(VIEW_STORAGE_KEY, activeView)
+  }, [activeView])
+
+  useEffect(() => {
+    setIsSectionsPanelOpen(false)
   }, [activeView])
 
   useEffect(() => {
@@ -499,14 +567,18 @@ function App() {
   }
 
   const pullGitHubRepo = async () => {
-    const parsedRepo = parseGitHubRepo(repoInput)
-    if (!parsedRepo) {
-      setError('Enter a valid GitHub repository URL or owner/repo.')
+    if (!githubAccessToken) {
+      setError('Login with GitHub first to pull repositories (bypasses rate limits).')
+      setRepoStatus('Tap "Login with GitHub" in the Sync section above to authenticate.')
       return
     }
 
-    setActiveView('dashboard')
-    setIsSectionsPanelOpen(false)
+    const parsedRepo = parseGitHubRepo(repoInput)
+    if (!parsedRepo) {
+      setError('Enter a valid GitHub repository URL, .git URL, or owner/repo.')
+      return
+    }
+
     setError('')
     setRepoStatus('Checking repository...')
     setIsPullingRepo(true)
@@ -515,13 +587,15 @@ function App() {
       const { docs, markdownCount, importedCount } = await fetchMarkdownDocsFromRepo({
         owner: parsedRepo.owner,
         repo: parsedRepo.repo,
-        token: githubAccessToken || '',
+        token: githubAccessToken,
       })
 
       setLibrary((previous) => mergeDocsIntoLibrary(previous, docs))
 
       const truncatedNote = markdownCount > importedCount ? ` Imported first ${importedCount} files.` : ''
       setRepoStatus(`Imported ${docs.length} files from ${parsedRepo.owner}/${parsedRepo.repo}.${truncatedNote}`)
+      setActiveView('dashboard')
+      setIsSectionsPanelOpen(false)
     } catch (repoError) {
       const message = explainGitHubError(repoError, 'Could not pull repository docs.')
       setError(message)
@@ -539,7 +613,7 @@ function App() {
 
     setError('')
     setIsStartingGitHubLogin(true)
-    sessionStorage.setItem(POST_AUTH_VIEW_KEY, 'settings')
+    sessionStorage.setItem(POST_AUTH_VIEW_KEY, 'sync')
 
     try {
       const { error: signInError } = await supabase.auth.signInWithOAuth({
@@ -786,6 +860,13 @@ function App() {
               Dashboard
             </button>
             <button
+              className={`nav-link ${activeView === 'sync' ? 'nav-link-active' : ''}`}
+              type="button"
+              onClick={() => setActiveView('sync')}
+            >
+              Sync
+            </button>
+            <button
               className={`nav-link ${activeView === 'settings' ? 'nav-link-active' : ''}`}
               type="button"
               onClick={() => setActiveView('settings')}
@@ -847,11 +928,13 @@ function App() {
           </>
         ) : (
           <section className="sidebar-info-card">
-            <h3>{activeView === 'settings' ? 'Settings' : 'Help'}</h3>
+            <h3>{activeView === 'sync' ? 'Sync' : activeView === 'settings' ? 'Settings' : 'Help'}</h3>
             <p>
-              {activeView === 'settings'
-                ? 'Manage app configuration, storage, and sync controls in one place.'
-                : 'See setup steps and usage guidance to onboard quickly.'}
+              {activeView === 'sync'
+                ? 'Upload docs, pull from GitHub, and sync repositories.'
+                : activeView === 'settings'
+                  ? 'Configure storage and file import settings.'
+                  : 'See setup steps and usage guidance to onboard quickly.'}
             </p>
           </section>
         )}
@@ -860,25 +943,29 @@ function App() {
       <div className="main-shell">
         <header className="main-topbar">
           <div className="mobile-reader-toolbar">
-            <button
-              className="button mobile-menu-button"
-              onClick={() => setIsSectionsPanelOpen(true)}
-              aria-label={activeView === 'dashboard' ? 'Open sections menu' : 'Open sidebar menu'}
-            >
-              <span className="hamburger" aria-hidden="true">
-                <span className="hamburger-line" />
-                <span className="hamburger-line" />
-                <span className="hamburger-line" />
-              </span>
-            </button>
+            {activeView === 'dashboard' ? (
+              <button
+                className="button mobile-menu-button"
+                onClick={() => setIsSectionsPanelOpen(true)}
+                aria-label="Open sections menu"
+              >
+                <span className="hamburger" aria-hidden="true">
+                  <span className="hamburger-line" />
+                  <span className="hamburger-line" />
+                  <span className="hamburger-line" />
+                </span>
+              </button>
+            ) : null}
             <span className="mobile-toolbar-title">
               {activeView === 'dashboard'
                 ? selectedDoc
                   ? selectedDoc.title
-                  : 'No document selected'
-                : activeView === 'settings'
-                  ? 'Configuration'
-                  : 'How to use'}
+                  : 'Dashboard'
+                : activeView === 'sync'
+                  ? 'Sync & Upload'
+                  : activeView === 'settings'
+                  ? 'Settings'
+                : 'Help'}
             </span>
           </div>
         </header>
@@ -912,14 +999,14 @@ function App() {
             </>
           ) : null}
 
-          {activeView === 'settings' ? (
+          {activeView === 'sync' ? (
             <>
               <section className="sync-card">
                 <div className="sync-card-header">
                   <div>
-                    <p className="eyebrow">Reusable Learning Docs</p>
-                    <h1>Settings & Sync</h1>
-                    <p className="sync-description">All upload, sync, and configuration controls are managed here.</p>
+                    <p className="eyebrow">Sync & Upload</p>
+                    <h1>Manage Your Docs</h1>
+                    <p className="sync-description">Upload local files, pull from public repos, and sync your docs.</p>
                   </div>
 
                   <div className="github-auth-row">
@@ -1018,8 +1105,56 @@ function App() {
 
                 {repoStatus ? <p className="repo-status">{repoStatus}</p> : null}
                 <div className="settings-divider" />
-                <h2 className="settings-title">Library & Upload Settings</h2>
-                <p className="settings-subtitle">Configure local storage and file imports.</p>
+                <h2 className="settings-title">Upload Files</h2>
+                <p className="settings-subtitle">Add markdown files and folders from your device.</p>
+
+                <div className="settings-grid">
+                  <section className="settings-item">
+                    <h3>Uploads</h3>
+                    <p>Add markdown files and folders from your device.</p>
+                    <div className="settings-actions">
+                      <label className="button button-primary" htmlFor="upload-md-sync">
+                        Upload .md files
+                      </label>
+                      <input
+                        id="upload-md-sync"
+                        type="file"
+                        accept=".md,text/markdown"
+                        multiple
+                        onChange={onUploadFiles}
+                      />
+                      <label className="button" htmlFor="upload-folder-sync">
+                        Upload folder
+                      </label>
+                      <input
+                        id="upload-folder-sync"
+                        type="file"
+                        multiple
+                        webkitdirectory=""
+                        directory=""
+                        onChange={onUploadFiles}
+                      />
+                    </div>
+                  </section>
+                </div>
+              </section>
+            </>
+          ) : null}
+
+          {activeView === 'settings' ? (
+            <>
+              <section className="settings-card">
+                <div className="settings-card-header">
+                  <div>
+                    <p className="eyebrow">Configuration</p>
+                    <h1>Settings</h1>
+                    <p className="settings-description">Manage your library, import, and export settings.</p>
+                  </div>
+                </div>
+
+                <div className="settings-divider" />
+                <h2 className="settings-title">Library Management</h2>
+                <p className="settings-subtitle">Import, export, and manage your document library.</p>
 
                 <div className="settings-grid">
                   <section className="settings-item">
@@ -1041,34 +1176,6 @@ function App() {
                       <button className="button button-danger" onClick={clearLibrary} disabled={!library.length}>
                         Clear library
                       </button>
-                    </div>
-                  </section>
-
-                  <section className="settings-item">
-                    <h3>Uploads</h3>
-                    <p>Add markdown files and folders from your device.</p>
-                    <div className="settings-actions">
-                      <label className="button button-primary" htmlFor="upload-md-settings">
-                        Upload .md files
-                      </label>
-                      <input
-                        id="upload-md-settings"
-                        type="file"
-                        accept=".md,text/markdown"
-                        multiple
-                        onChange={onUploadFiles}
-                      />
-                      <label className="button" htmlFor="upload-folder-settings">
-                        Upload folder
-                      </label>
-                      <input
-                        id="upload-folder-settings"
-                        type="file"
-                        multiple
-                        webkitdirectory=""
-                        directory=""
-                        onChange={onUploadFiles}
-                      />
                     </div>
                   </section>
                 </div>
@@ -1099,6 +1206,37 @@ function App() {
           ) : null}
         </main>
       </div>
+
+      <nav className="mobile-bottom-nav" aria-label="Mobile navigation">
+        <button
+          className={`mobile-bottom-link ${activeView === 'dashboard' ? 'mobile-bottom-link-active' : ''}`}
+          type="button"
+          onClick={() => setActiveView('dashboard')}
+        >
+          Dashboard
+        </button>
+        <button
+          className={`mobile-bottom-link ${activeView === 'sync' ? 'mobile-bottom-link-active' : ''}`}
+          type="button"
+          onClick={() => setActiveView('sync')}
+        >
+          Sync
+        </button>
+        <button
+          className={`mobile-bottom-link ${activeView === 'settings' ? 'mobile-bottom-link-active' : ''}`}
+          type="button"
+          onClick={() => setActiveView('settings')}
+        >
+          Settings
+        </button>
+        <button
+          className={`mobile-bottom-link ${activeView === 'help' ? 'mobile-bottom-link-active' : ''}`}
+          type="button"
+          onClick={() => setActiveView('help')}
+        >
+          Help
+        </button>
+      </nav>
 
       {isSectionsPanelOpen ? <button className="sidebar-scrim" onClick={() => setIsSectionsPanelOpen(false)} /> : null}
     </div>
