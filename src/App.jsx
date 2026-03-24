@@ -60,6 +60,90 @@ function compareBySourceName(a, b) {
   return a.localeCompare(b)
 }
 
+function normalizeDocPath(value) {
+  return String(value || '')
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '')
+    .replace(/\/+/g, '/')
+    .trim()
+}
+
+function parseDocLocation(doc) {
+  if (!doc) {
+    return { repoKey: 'local:Local Uploads', path: '' }
+  }
+
+  const githubMatch = String(doc.source || '').match(/^github:([^/]+\/[^/]+)\/(.+)$/)
+  if (githubMatch) {
+    return {
+      repoKey: `github:${githubMatch[1]}`,
+      path: normalizeDocPath(githubMatch[2]),
+    }
+  }
+
+  return {
+    repoKey: `local:${doc.sourceRepo || 'Local Uploads'}`,
+    path: normalizeDocPath(doc.source || ''),
+  }
+}
+
+function getPathVariants(path) {
+  const normalized = normalizeDocPath(path)
+  if (!normalized) {
+    return []
+  }
+
+  const basename = normalized.split('/').pop() || normalized
+  const withoutExt = normalized.replace(/\.(md|mdx)$/i, '')
+  const basenameWithoutExt = basename.replace(/\.(md|mdx)$/i, '')
+
+  return Array.from(new Set([normalized, withoutExt, basename, basenameWithoutExt]))
+}
+
+function splitHref(rawHref) {
+  const href = String(rawHref || '')
+  const hashIndex = href.indexOf('#')
+  const queryIndex = href.indexOf('?')
+
+  const pathEnd =
+    hashIndex >= 0 && queryIndex >= 0
+      ? Math.min(hashIndex, queryIndex)
+      : hashIndex >= 0
+        ? hashIndex
+        : queryIndex >= 0
+          ? queryIndex
+          : href.length
+
+  const path = href.slice(0, pathEnd)
+  const hash = hashIndex >= 0 ? href.slice(hashIndex + 1) : ''
+
+  return { path, hash }
+}
+
+function resolveRelativePath(basePath, hrefPath) {
+  const sourcePath = normalizeDocPath(basePath)
+  const targetPath = normalizeDocPath(hrefPath)
+
+  const baseDir = sourcePath.includes('/') ? sourcePath.slice(0, sourcePath.lastIndexOf('/') + 1) : ''
+  const merged = `${baseDir}${targetPath}`
+
+  const resolvedParts = []
+  for (const part of merged.split('/')) {
+    if (!part || part === '.') {
+      continue
+    }
+
+    if (part === '..') {
+      resolvedParts.pop()
+      continue
+    }
+
+    resolvedParts.push(part)
+  }
+
+  return resolvedParts.join('/')
+}
+
 function getSectionFromFile(file) {
   const relativePath = file.webkitRelativePath || ''
 
@@ -572,6 +656,113 @@ function App() {
     return allDocs.find((doc) => doc.id === selectedDocId) || null
   }, [allDocs, selectedDocId])
 
+  const docsByRepoAndPath = useMemo(() => {
+    const repoMap = new Map()
+
+    for (const doc of allDocs) {
+      const location = parseDocLocation(doc)
+      if (!location.path) {
+        continue
+      }
+
+      if (!repoMap.has(location.repoKey)) {
+        repoMap.set(location.repoKey, new Map())
+      }
+
+      const pathMap = repoMap.get(location.repoKey)
+      for (const variant of getPathVariants(location.path)) {
+        const key = variant.toLowerCase()
+        if (!pathMap.has(key)) {
+          pathMap.set(key, doc)
+        }
+      }
+    }
+
+    return repoMap
+  }, [allDocs])
+
+  const markdownComponents = useMemo(() => {
+    const externalPattern = /^(https?:|mailto:|tel:)/i
+
+    const findInternalDoc = (href) => {
+      const trimmedHref = String(href || '').trim()
+      if (!trimmedHref || externalPattern.test(trimmedHref) || trimmedHref.startsWith('#')) {
+        return null
+      }
+
+      const { path: rawPath } = splitHref(trimmedHref)
+      if (!rawPath) {
+        return null
+      }
+
+      let decodedPath = rawPath
+      try {
+        decodedPath = decodeURIComponent(rawPath)
+      } catch {
+        decodedPath = rawPath
+      }
+
+      const selectedLocation = parseDocLocation(selectedDoc)
+      const fromRoot = decodedPath.startsWith('/')
+      const absolutePath = fromRoot
+        ? normalizeDocPath(decodedPath.slice(1))
+        : resolveRelativePath(selectedLocation.path, decodedPath)
+
+      const candidates = getPathVariants(absolutePath).map((value) => value.toLowerCase())
+      if (!candidates.length) {
+        return null
+      }
+
+      const selectedRepoPathMap = docsByRepoAndPath.get(selectedLocation.repoKey)
+      if (selectedRepoPathMap) {
+        for (const candidate of candidates) {
+          if (selectedRepoPathMap.has(candidate)) {
+            return selectedRepoPathMap.get(candidate)
+          }
+        }
+      }
+
+      for (const pathMap of docsByRepoAndPath.values()) {
+        for (const candidate of candidates) {
+          if (pathMap.has(candidate)) {
+            return pathMap.get(candidate)
+          }
+        }
+      }
+
+      return null
+    }
+
+    return {
+      a: ({ href, children, ...props }) => {
+        const internalDoc = findInternalDoc(href)
+        if (internalDoc) {
+          return (
+            <a
+              {...props}
+              href={href}
+              onClick={(event) => {
+                event.preventDefault()
+                setError('')
+                setActiveView('dashboard')
+                setSelectedDocId(internalDoc.id)
+              }}
+            >
+              {children}
+            </a>
+          )
+        }
+
+        const isExternal = externalPattern.test(String(href || ''))
+        return (
+          <a {...props} href={href} target={isExternal ? '_blank' : undefined} rel={isExternal ? 'noreferrer' : undefined}>
+            {children}
+          </a>
+        )
+      },
+    }
+  }, [docsByRepoAndPath, selectedDoc, setActiveView, setError, setSelectedDocId])
+
   const onUploadFiles = async (event) => {
     const files = Array.from(event.target.files || [])
     event.target.value = ''
@@ -1045,7 +1236,9 @@ function App() {
                   </header>
 
                   <div className="markdown-body">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{selectedDoc.content}</ReactMarkdown>
+                    <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                      {selectedDoc.content}
+                    </ReactMarkdown>
                   </div>
                 </article>
               ) : (
