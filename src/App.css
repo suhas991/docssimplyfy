@@ -100,11 +100,57 @@
   margin-top: 10px;
 }
 
-.section-block h4 {
+.section-toggle {
+  width: 100%;
+  border: none;
+  background: transparent;
+  padding: 0;
   margin: 0 0 6px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.section-toggle-title {
   font-family: var(--sans);
   font-size: 0.82rem;
-  color: var(--muted);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.section-toggle-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  color: var(--text-primary);
+  font-size: 0.78rem;
+}
+
+.section-toggle-count {
+  border: 1px solid var(--doc-active-border);
+  border-radius: 999px;
+  padding: 0.08rem 0.48rem;
+  min-width: 1.7rem;
+  text-align: center;
+  font-weight: 700;
+  color: var(--button-primary-bg);
+  background: rgba(127, 171, 199, 0.2);
+}
+
+.section-toggle:hover .section-toggle-title,
+.section-toggle:hover .section-toggle-meta,
+.section-toggle:focus-visible .section-toggle-title,
+.section-toggle:focus-visible .section-toggle-meta {
+  color: var(--button-primary-bg);
+}
+
+.section-toggle:focus-visible {
+  outline: 2px solid var(--doc-active-border);
+  outline-offset: 2px;
+  border-radius: 6px;
 }
 
 .section-block ul {
@@ -467,6 +513,10 @@
   padding: clamp(16px, 2.4vw, 28px);
 }
 
+.document-header {
+  min-width: 0;
+}
+
 .document-header p {
   margin: 0;
   color: var(--eyebrow);
@@ -474,16 +524,22 @@
   letter-spacing: 0.09rem;
   font-family: var(--sans);
   font-size: 0.75rem;
+  overflow-wrap: anywhere;
 }
 
 .document-header h2 {
   margin: 8px 0 4px;
   font-size: clamp(1.5rem, 2.5vw, 2.2rem);
+  line-height: 1.2;
+  overflow-wrap: anywhere;
 }
 
 .document-header span {
+  display: block;
   color: var(--muted);
   font-size: 0.9rem;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .markdown-body {
@@ -731,6 +787,15 @@
   .repo-picker-actions {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .document-header h2 {
+    font-size: clamp(1.2rem, 5.8vw, 1.8rem);
+  }
+
+  .document-header span {
+    font-size: 0.82rem;
+    line-height: 1.45;
   }
 
   .sidebar-scrim {

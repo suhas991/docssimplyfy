@@ -9,6 +9,18 @@ const GH_PROVIDER_TOKEN_STORAGE_KEY = 'docs-site.github-provider-token.v1'
 const VIEW_STORAGE_KEY = 'docs-site.active-view.v1'
 const POST_AUTH_VIEW_KEY = 'docs-site.post-auth-view.v1'
 
+function normalizeView(value) {
+  if (value === 'sync') {
+    return 'git'
+  }
+
+  if (value === 'dashboard' || value === 'git' || value === 'settings' || value === 'help') {
+    return value
+  }
+
+  return 'dashboard'
+}
+
 function toSlug(value) {
   return value
     .toLowerCase()
@@ -16,8 +28,36 @@ function toSlug(value) {
     .replace(/(^-|-$)/g, '')
 }
 
-function stripNumericPrefix(value) {
-  return value.replace(/^\d+[_\-\s]*/, '').replace(/_/g, ' ')
+function getFolderName(value) {
+  return value || 'General'
+}
+
+function getFileNameWithoutExtension(value) {
+  return value.replace(/\.(md|mdx)$/i, '')
+}
+
+function parseOrderPrefix(value) {
+  const match = value.match(/^(\d+)/)
+  return match ? Number(match[1]) : null
+}
+
+function compareBySourceName(a, b) {
+  const aPrefix = parseOrderPrefix(a)
+  const bPrefix = parseOrderPrefix(b)
+
+  if (aPrefix !== null && bPrefix !== null && aPrefix !== bPrefix) {
+    return aPrefix - bPrefix
+  }
+
+  if (aPrefix !== null && bPrefix === null) {
+    return -1
+  }
+
+  if (aPrefix === null && bPrefix !== null) {
+    return 1
+  }
+
+  return a.localeCompare(b)
 }
 
 function getSectionFromFile(file) {
@@ -25,22 +65,20 @@ function getSectionFromFile(file) {
 
   if (relativePath.includes('/')) {
     const [firstFolder] = relativePath.split('/')
-    return stripNumericPrefix(firstFolder) || 'General'
+    return getFolderName(firstFolder)
   }
 
-  const [fileNameWithoutExt] = file.name.split('.md')
+  const fileNameWithoutExt = getFileNameWithoutExtension(file.name)
   if (fileNameWithoutExt.includes('__')) {
     const [prefix] = fileNameWithoutExt.split('__')
-    return stripNumericPrefix(prefix) || 'General'
+    return getFolderName(prefix)
   }
 
   return 'General'
 }
 
 function getTitleFromFile(file) {
-  const [fileNameWithoutExt] = file.name.split('.md')
-  const cleanedName = fileNameWithoutExt.replace(/^\d+[_\-\s]*/, '')
-  return cleanedName.replace(/_/g, ' ')
+  return getFileNameWithoutExtension(file.name)
 }
 
 function getSectionFromPath(path) {
@@ -49,14 +87,12 @@ function getSectionFromPath(path) {
   }
 
   const [firstFolder] = path.split('/')
-  return stripNumericPrefix(firstFolder) || 'General'
+  return getFolderName(firstFolder)
 }
 
 function getTitleFromPath(path) {
   const name = path.split('/').pop() || path
-  const withoutExt = name.replace(/\.(md|mdx)$/i, '')
-  const cleanedName = withoutExt.replace(/^\d+[_\-\s]*/, '')
-  return cleanedName.replace(/_/g, ' ')
+  return getFileNameWithoutExtension(name)
 }
 
 function getRepoFromSource(source) {
@@ -380,18 +416,19 @@ function sectionSort(a, b) {
     return byRepo
   }
 
-  return a.title.localeCompare(b.title)
+  return compareBySourceName(a.section || a.title || '', b.section || b.title || '')
 }
 
 function docSort(a, b) {
-  return a.title.localeCompare(b.title)
+  return compareBySourceName(a.title || '', b.title || '')
 }
 
 function App() {
   const [activeView, setActiveView] = useState(() => {
-    return localStorage.getItem(VIEW_STORAGE_KEY) || 'dashboard'
+    return normalizeView(localStorage.getItem(VIEW_STORAGE_KEY))
   })
   const [library, setLibrary] = useState([])
+  const [expandedSectionIds, setExpandedSectionIds] = useState(() => new Set())
   const [selectedDocId, setSelectedDocId] = useState('')
   const [isSectionsPanelOpen, setIsSectionsPanelOpen] = useState(false)
   const [error, setError] = useState('')
@@ -480,7 +517,7 @@ function App() {
 
         const postAuthView = sessionStorage.getItem(POST_AUTH_VIEW_KEY)
         if (postAuthView) {
-          setActiveView(postAuthView)
+          setActiveView(normalizeView(postAuthView))
           sessionStorage.removeItem(POST_AUTH_VIEW_KEY)
         }
       } else if (!session) {
@@ -613,7 +650,7 @@ function App() {
 
     setError('')
     setIsStartingGitHubLogin(true)
-    sessionStorage.setItem(POST_AUTH_VIEW_KEY, 'sync')
+    sessionStorage.setItem(POST_AUTH_VIEW_KEY, 'git')
 
     try {
       const { error: signInError } = await supabase.auth.signInWithOAuth({
@@ -860,11 +897,11 @@ function App() {
               Dashboard
             </button>
             <button
-              className={`nav-link ${activeView === 'sync' ? 'nav-link-active' : ''}`}
+              className={`nav-link ${activeView === 'git' ? 'nav-link-active' : ''}`}
               type="button"
-              onClick={() => setActiveView('sync')}
+              onClick={() => setActiveView('git')}
             >
-              Sync
+              Git
             </button>
             <button
               className={`nav-link ${activeView === 'settings' ? 'nav-link-active' : ''}`}
@@ -900,23 +937,47 @@ function App() {
                     <h3>{repoGroup.repo}</h3>
                     {repoGroup.sections.map((section) => (
                       <section key={section.id} className="section-block">
-                        <h4>{section.title}</h4>
-                        <ul>
-                          {section.docs.map((doc) => (
-                            <li key={doc.id}>
-                              <button
-                                className={`doc-link ${selectedDocId === doc.id ? 'active' : ''}`}
-                                onClick={() => {
-                                  setActiveView('dashboard')
-                                  setSelectedDocId(doc.id)
-                                  setIsSectionsPanelOpen(false)
-                                }}
-                              >
-                                {doc.title}
-                              </button>
-                            </li>
-                          ))}
-                        </ul>
+                        <button
+                          type="button"
+                          className="section-toggle"
+                          aria-expanded={
+                            expandedSectionIds.has(section.id) || section.docs.some((doc) => doc.id === selectedDocId)
+                          }
+                          onClick={() => {
+                            setExpandedSectionIds((previous) => {
+                              const next = new Set(previous)
+                              if (next.has(section.id)) {
+                                next.delete(section.id)
+                              } else {
+                                next.add(section.id)
+                              }
+                              return next
+                            })
+                          }}
+                        >
+                          <span className="section-toggle-title">{section.title}</span>
+                          <span className="section-toggle-meta">
+                            <span className="section-toggle-count">{section.docs.length}</span>
+                          </span>
+                        </button>
+                        {expandedSectionIds.has(section.id) || section.docs.some((doc) => doc.id === selectedDocId) ? (
+                          <ul>
+                            {section.docs.map((doc) => (
+                              <li key={doc.id}>
+                                <button
+                                  className={`doc-link ${selectedDocId === doc.id ? 'active' : ''}`}
+                                  onClick={() => {
+                                    setActiveView('dashboard')
+                                    setSelectedDocId(doc.id)
+                                    setIsSectionsPanelOpen(false)
+                                  }}
+                                >
+                                  {doc.title}
+                                </button>
+                              </li>
+                            ))}
+                          </ul>
+                        ) : null}
                       </section>
                     ))}
                   </section>
@@ -928,10 +989,10 @@ function App() {
           </>
         ) : (
           <section className="sidebar-info-card">
-            <h3>{activeView === 'sync' ? 'Sync' : activeView === 'settings' ? 'Settings' : 'Help'}</h3>
+            <h3>{activeView === 'git' ? 'Git' : activeView === 'settings' ? 'Settings' : 'Help'}</h3>
             <p>
-              {activeView === 'sync'
-                ? 'Upload docs, pull from GitHub, and sync repositories.'
+              {activeView === 'git'
+                ? 'Pull from GitHub and sync repositories.'
                 : activeView === 'settings'
                   ? 'Configure storage and file import settings.'
                   : 'See setup steps and usage guidance to onboard quickly.'}
@@ -961,8 +1022,8 @@ function App() {
                 ? selectedDoc
                   ? selectedDoc.title
                   : 'Dashboard'
-                : activeView === 'sync'
-                  ? 'Sync & Upload'
+                : activeView === 'git'
+                  ? 'Git'
                   : activeView === 'settings'
                   ? 'Settings'
                 : 'Help'}
@@ -999,14 +1060,14 @@ function App() {
             </>
           ) : null}
 
-          {activeView === 'sync' ? (
+          {activeView === 'git' ? (
             <>
               <section className="sync-card">
                 <div className="sync-card-header">
                   <div>
-                    <p className="eyebrow">Sync & Upload</p>
-                    <h1>Manage Your Docs</h1>
-                    <p className="sync-description">Upload local files, pull from public repos, and sync your docs.</p>
+                    <p className="eyebrow">Git</p>
+                    <h1>Manage Git Docs</h1>
+                    <p className="sync-description">Pull from public repos and sync your docs.</p>
                   </div>
 
                   <div className="github-auth-row">
@@ -1104,39 +1165,6 @@ function App() {
                 </div>
 
                 {repoStatus ? <p className="repo-status">{repoStatus}</p> : null}
-                <div className="settings-divider" />
-                <h2 className="settings-title">Upload Files</h2>
-                <p className="settings-subtitle">Add markdown files and folders from your device.</p>
-
-                <div className="settings-grid">
-                  <section className="settings-item">
-                    <h3>Uploads</h3>
-                    <p>Add markdown files and folders from your device.</p>
-                    <div className="settings-actions">
-                      <label className="button button-primary" htmlFor="upload-md-sync">
-                        Upload .md files
-                      </label>
-                      <input
-                        id="upload-md-sync"
-                        type="file"
-                        accept=".md,text/markdown"
-                        multiple
-                        onChange={onUploadFiles}
-                      />
-                      <label className="button" htmlFor="upload-folder-sync">
-                        Upload folder
-                      </label>
-                      <input
-                        id="upload-folder-sync"
-                        type="file"
-                        multiple
-                        webkitdirectory=""
-                        directory=""
-                        onChange={onUploadFiles}
-                      />
-                    </div>
-                  </section>
-                </div>
               </section>
             </>
           ) : null}
@@ -1150,6 +1178,40 @@ function App() {
                     <h1>Settings</h1>
                     <p className="settings-description">Manage your library, import, and export settings.</p>
                   </div>
+                </div>
+
+                <div className="settings-divider" />
+                <h2 className="settings-title">Upload Files</h2>
+                <p className="settings-subtitle">Add markdown files and folders from your device.</p>
+
+                <div className="settings-grid">
+                  <section className="settings-item">
+                    <h3>Uploads</h3>
+                    <p>Add markdown files and folders from your device.</p>
+                    <div className="settings-actions">
+                      <label className="button button-primary" htmlFor="upload-md-settings">
+                        Upload .md files
+                      </label>
+                      <input
+                        id="upload-md-settings"
+                        type="file"
+                        accept=".md,text/markdown"
+                        multiple
+                        onChange={onUploadFiles}
+                      />
+                      <label className="button" htmlFor="upload-folder-settings">
+                        Upload folder
+                      </label>
+                      <input
+                        id="upload-folder-settings"
+                        type="file"
+                        multiple
+                        webkitdirectory=""
+                        directory=""
+                        onChange={onUploadFiles}
+                      />
+                    </div>
+                  </section>
                 </div>
 
                 <div className="settings-divider" />
@@ -1190,8 +1252,8 @@ function App() {
 
               <ol className="help-list">
                 <li>Use Dashboard as your reading area only.</li>
-                <li>Open Settings for login, sync, upload, import, and export controls.</li>
-                <li>Click Load My Repos, choose repositories, then sync selected docs.</li>
+                <li>Open Git for login, pull, and repository sync controls.</li>
+                <li>Open Settings for upload, import, and export controls.</li>
                 <li>Use the sidebar to browse repositories, sections, and documents.</li>
                 <li>Use Help for setup and troubleshooting steps anytime.</li>
               </ol>
@@ -1216,11 +1278,11 @@ function App() {
           Dashboard
         </button>
         <button
-          className={`mobile-bottom-link ${activeView === 'sync' ? 'mobile-bottom-link-active' : ''}`}
+          className={`mobile-bottom-link ${activeView === 'git' ? 'mobile-bottom-link-active' : ''}`}
           type="button"
-          onClick={() => setActiveView('sync')}
+          onClick={() => setActiveView('git')}
         >
-          Sync
+          Git
         </button>
         <button
           className={`mobile-bottom-link ${activeView === 'settings' ? 'mobile-bottom-link-active' : ''}`}
