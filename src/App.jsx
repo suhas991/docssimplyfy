@@ -540,8 +540,19 @@ function App() {
       if (!cached) {
         return
       }
-      const parsed = JSON.parse(cached)
       if (Array.isArray(parsed)) {
+      const [deferredPrompt, setDeferredPrompt] = useState(null)
+
+      const isMobileSyncBarVisible = activeView === 'git' && gitSyncMode === 'repos' && Boolean(githubUser)
+
+      useEffect(() => {
+        const handler = (e) => {
+          e.preventDefault()
+          setDeferredPrompt(e)
+        }
+        window.addEventListener('beforeinstallprompt', handler)
+        return () => window.removeEventListener('beforeinstallprompt', handler)
+      }, [])
         setLibrary(parsed)
       }
     } catch {
