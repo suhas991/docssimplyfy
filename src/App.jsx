@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { isSupabaseConfigured, supabase } from './lib/supabase'
@@ -8,13 +8,131 @@ const STORAGE_KEY = 'docs-site.library.v1'
 const GH_PROVIDER_TOKEN_STORAGE_KEY = 'docs-site.github-provider-token.v1'
 const VIEW_STORAGE_KEY = 'docs-site.active-view.v1'
 const POST_AUTH_VIEW_KEY = 'docs-site.post-auth-view.v1'
+const SYNC_META_STORAGE_KEY = 'docs-site.sync-meta.v1'
+const BACKUP_REPO_NAME = 'docs-hub-backup'
+const BACKUP_REPO_FILE = 'docs-library-backup.json'
+const LIBRARY_DB_NAME = 'docs-site-db'
+const LIBRARY_DB_VERSION = 1
+const LIBRARY_STORE_NAME = 'app-state'
+const LIBRARY_STORE_KEY = 'library'
+
+function openLibraryDb() {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === 'undefined') {
+      resolve(null)
+      return
+    }
+
+    const request = indexedDB.open(LIBRARY_DB_NAME, LIBRARY_DB_VERSION)
+
+    request.onupgradeneeded = () => {
+      const db = request.result
+      if (!db.objectStoreNames.contains(LIBRARY_STORE_NAME)) {
+        db.createObjectStore(LIBRARY_STORE_NAME, { keyPath: 'key' })
+      }
+    }
+
+    request.onsuccess = () => {
+      resolve(request.result)
+    }
+
+    request.onerror = () => {
+      reject(request.error || new Error('Failed to open IndexedDB'))
+    }
+  })
+}
+
+async function readLibraryFromIndexedDb() {
+  const db = await openLibraryDb()
+  if (!db) {
+    return null
+  }
+
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(LIBRARY_STORE_NAME, 'readonly')
+    const store = transaction.objectStore(LIBRARY_STORE_NAME)
+    const request = store.get(LIBRARY_STORE_KEY)
+
+    request.onsuccess = () => {
+      const record = request.result
+      resolve(Array.isArray(record?.value) ? record.value : null)
+    }
+
+    request.onerror = () => {
+      reject(request.error || new Error('Failed to read library from IndexedDB'))
+    }
+
+    transaction.oncomplete = () => {
+      db.close()
+    }
+  })
+}
+
+async function writeLibraryToIndexedDb(library) {
+  const db = await openLibraryDb()
+  if (!db) {
+    return
+  }
+
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(LIBRARY_STORE_NAME, 'readwrite')
+    const store = transaction.objectStore(LIBRARY_STORE_NAME)
+    store.put({ key: LIBRARY_STORE_KEY, value: library, updatedAt: new Date().toISOString() })
+
+    transaction.oncomplete = () => {
+      db.close()
+      resolve()
+    }
+
+    transaction.onerror = () => {
+      db.close()
+      reject(transaction.error || new Error('Failed to save library to IndexedDB'))
+    }
+  })
+}
+
+async function deleteLibraryFromIndexedDb() {
+  const db = await openLibraryDb()
+  if (!db) {
+    return
+  }
+
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(LIBRARY_STORE_NAME, 'readwrite')
+    const store = transaction.objectStore(LIBRARY_STORE_NAME)
+    store.delete(LIBRARY_STORE_KEY)
+
+    transaction.oncomplete = () => {
+      db.close()
+      resolve()
+    }
+
+    transaction.onerror = () => {
+      db.close()
+      reject(transaction.error || new Error('Failed to clear library from IndexedDB'))
+    }
+  })
+}
+
+function formatDateTime(value) {
+  if (!value) {
+    return 'Never'
+  }
+
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return 'Never'
+  }
+
+  return date.toLocaleString()
+}
 
 function normalizeView(value) {
   if (value === 'sync') {
     return 'git'
   }
 
-  if (value === 'dashboard' || value === 'git' || value === 'settings') {
+  if (value === 'dashboard' || value === 'git' || value === 'settings' || value === 'profile') {
     return value
   }
 
@@ -320,6 +438,15 @@ function decodeGitHubContent(base64Content) {
   return new TextDecoder('utf-8').decode(bytes)
 }
 
+function encodeGitHubContent(content) {
+  const encoded = new TextEncoder().encode(content)
+  let binary = ''
+  for (const byte of encoded) {
+    binary += String.fromCharCode(byte)
+  }
+  return btoa(binary)
+}
+
 async function githubRequest(path, token, options = {}) {
   let lastError = null
 
@@ -340,7 +467,7 @@ async function githubRequest(path, token, options = {}) {
 
       if (!response.ok) {
         const errorText = await response.text()
-        const apiError = `GitHub API error: ${response.status} ${response.statusText}. ${errorText}`
+        const apiError = `GitHub API error on ${path}: ${response.status} ${response.statusText}. ${errorText}`
         if (attempt === 1 || !import.meta.env.DEV) {
           throw new Error(apiError)
         }
@@ -348,7 +475,16 @@ async function githubRequest(path, token, options = {}) {
         continue
       }
 
-      return response.json()
+      if (response.status === 204) {
+        return null
+      }
+
+      const contentType = response.headers.get('content-type') || ''
+      if (contentType.includes('application/json')) {
+        return response.json()
+      }
+
+      return response.text()
     } catch (err) {
       lastError = err instanceof Error ? err.message : String(err)
       if (attempt === 1 || !import.meta.env.DEV) {
@@ -389,6 +525,26 @@ function explainGitHubError(error, fallbackMessage) {
 
   if (msg.includes('rate limit')) {
     return 'GitHub rate limit reached. Try again in an hour or use a token with higher limits.'
+  }
+
+  const isBackupRepoMissing =
+    lowerMessage.includes(BACKUP_REPO_NAME.toLowerCase()) &&
+    (lowerMessage.includes('404') || lowerMessage.includes('not found'))
+  if (isBackupRepoMissing) {
+    return 'No cloud backup found yet in your backup repository.'
+  }
+
+  if (
+    lowerMessage.includes('403') ||
+    lowerMessage.includes('resource not accessible') ||
+    lowerMessage.includes('requires authentication') ||
+    lowerMessage.includes('insufficient')
+  ) {
+    return 'GitHub permission issue. Disconnect and login again to refresh scopes.'
+  }
+
+  if (lowerMessage.includes('401') || lowerMessage.includes('bad credentials')) {
+    return 'GitHub session expired. Disconnect and login again.'
   }
 
   if (msg.includes('Not Found')) {
@@ -514,11 +670,36 @@ function App() {
   const [library, setLibrary] = useState([])
   const [expandedSectionIds, setExpandedSectionIds] = useState(() => new Set())
   const [selectedDocId, setSelectedDocId] = useState('')
+  const [dashboardSearchQuery, setDashboardSearchQuery] = useState('')
   const [isSectionsPanelOpen, setIsSectionsPanelOpen] = useState(false)
+  const [hasHydratedLibrary, setHasHydratedLibrary] = useState(false)
   const [error, setError] = useState('')
+  const [storageWarning, setStorageWarning] = useState('')
   const [repoInput, setRepoInput] = useState('')
   const [isPullingRepo, setIsPullingRepo] = useState(false)
   const [repoStatus, setRepoStatus] = useState('')
+  const [cloudBackupStatus, setCloudBackupStatus] = useState('')
+  const [isBackingUpCloud, setIsBackingUpCloud] = useState(false)
+  const [isRestoringCloud, setIsRestoringCloud] = useState(false)
+  const [isDeletingCloudBackup, setIsDeletingCloudBackup] = useState(false)
+  const [autoBackupEnabled, setAutoBackupEnabled] = useState(true)
+  const [lastAutoBackupAt, setLastAutoBackupAt] = useState('')
+  const [syncMeta, setSyncMeta] = useState(() => {
+    try {
+      const cached = localStorage.getItem(SYNC_META_STORAGE_KEY)
+      if (!cached) {
+        return { summary: '', at: '' }
+      }
+
+      const parsed = JSON.parse(cached)
+      return {
+        summary: String(parsed?.summary || ''),
+        at: String(parsed?.at || ''),
+      }
+    } catch {
+      return { summary: '', at: '' }
+    }
+  })
   const [githubUser, setGithubUser] = useState(null)
   const [githubLogin, setGithubLogin] = useState('')
   const [githubAccessToken, setGithubAccessToken] = useState('')
@@ -531,37 +712,116 @@ function App() {
   const [isStartingGitHubLogin, setIsStartingGitHubLogin] = useState(false)
   const [isForkSyncing, setIsForkSyncing] = useState(false)
   const [gitSyncMode, setGitSyncMode] = useState('repos')
+  const lastAutoBackedSyncAtRef = useRef(syncMeta.at || '')
+  const hasAttemptedLoginRestoreRef = useRef(false)
 
   const isMobileSyncBarVisible = activeView === 'git' && gitSyncMode === 'repos' && Boolean(githubUser)
 
+  const updateSyncMeta = (summary) => {
+    setSyncMeta({
+      summary,
+      at: new Date().toISOString(),
+    })
+  }
+
   useEffect(() => {
-    try {
-      const cached = localStorage.getItem(STORAGE_KEY)
-      if (!cached) {
-        return
-      }
-      if (Array.isArray(parsed)) {
-      const [deferredPrompt, setDeferredPrompt] = useState(null)
+    let cancelled = false
 
-      const isMobileSyncBarVisible = activeView === 'git' && gitSyncMode === 'repos' && Boolean(githubUser)
-
-      useEffect(() => {
-        const handler = (e) => {
-          e.preventDefault()
-          setDeferredPrompt(e)
+    const hydrateLibrary = async () => {
+      try {
+        const indexedDbLibrary = await readLibraryFromIndexedDb()
+        if (cancelled) {
+          return
         }
-        window.addEventListener('beforeinstallprompt', handler)
-        return () => window.removeEventListener('beforeinstallprompt', handler)
-      }, [])
-        setLibrary(parsed)
+
+        if (Array.isArray(indexedDbLibrary)) {
+          setLibrary(indexedDbLibrary)
+          setHasHydratedLibrary(true)
+          return
+        }
+      } catch {
+        // Fall back to localStorage if IndexedDB is unavailable.
       }
-    } catch {
-      setError('Could not read saved library. You can re-upload your files.')
+
+      try {
+        const cached = localStorage.getItem(STORAGE_KEY)
+        if (!cached) {
+          setHasHydratedLibrary(true)
+          return
+        }
+
+        const parsed = JSON.parse(cached)
+        if (Array.isArray(parsed)) {
+          setLibrary(parsed)
+          writeLibraryToIndexedDb(parsed).catch(() => {
+            // Best-effort migration from localStorage to IndexedDB.
+          })
+        }
+        setHasHydratedLibrary(true)
+      } catch {
+        setError('Could not read saved library. You can re-upload your files.')
+        setHasHydratedLibrary(true)
+      }
+    }
+
+    hydrateLibrary()
+
+    return () => {
+      cancelled = true
     }
   }, [])
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(library))
+    if (!hasHydratedLibrary) {
+      return
+    }
+
+    const persistLibrary = async () => {
+      try {
+        await writeLibraryToIndexedDb(library)
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(library))
+        setStorageWarning('')
+      } catch {
+        setStorageWarning('Storage is full. Export your library or clear unused docs to avoid data loss.')
+      }
+    }
+
+    persistLibrary()
+  }, [library, hasHydratedLibrary])
+
+  useEffect(() => {
+    localStorage.setItem(SYNC_META_STORAGE_KEY, JSON.stringify(syncMeta))
+  }, [syncMeta])
+
+  useEffect(() => {
+    let cancelled = false
+
+    const checkStorage = async () => {
+      if (!navigator.storage?.estimate) {
+        return
+      }
+
+      try {
+        const estimate = await navigator.storage.estimate()
+        if (cancelled) {
+          return
+        }
+
+        const usage = Number(estimate.usage || 0)
+        const quota = Number(estimate.quota || 0)
+
+        if (quota > 0 && usage / quota >= 0.85) {
+          setStorageWarning('Storage is above 85%. Export or clear docs to prevent sync/import failures.')
+        }
+      } catch {
+        // Ignore estimate failures on unsupported browsers.
+      }
+    }
+
+    checkStorage()
+    return () => {
+      cancelled = true
+    }
   }, [library])
 
   useEffect(() => {
@@ -622,6 +882,7 @@ function App() {
       } else if (!session) {
         setGithubAccessToken('')
         setGithubLogin('')
+        hasAttemptedLoginRestoreRef.current = false
         sessionStorage.removeItem(GH_PROVIDER_TOKEN_STORAGE_KEY)
       }
     })
@@ -636,10 +897,35 @@ function App() {
     return library.flatMap((section) => section.docs)
   }, [library])
 
+  const filteredLibrary = useMemo(() => {
+    const query = dashboardSearchQuery.trim().toLowerCase()
+    if (!query) {
+      return library
+    }
+
+    return library
+      .map((section) => {
+        const matchingDocs = section.docs.filter((doc) => {
+          const searchable = [doc.title, doc.section, doc.sourceRepo, doc.source, doc.content].join(' ').toLowerCase()
+          return searchable.includes(query)
+        })
+
+        return {
+          ...section,
+          docs: matchingDocs,
+        }
+      })
+      .filter((section) => section.docs.length > 0)
+  }, [library, dashboardSearchQuery])
+
+  const filteredDocsCount = useMemo(() => {
+    return filteredLibrary.reduce((total, section) => total + section.docs.length, 0)
+  }, [filteredLibrary])
+
   const repoGroups = useMemo(() => {
     const groups = new Map()
 
-    for (const section of library) {
+    for (const section of filteredLibrary) {
       const repo = section.sourceRepo || 'Local Uploads'
       if (!groups.has(repo)) {
         groups.set(repo, [])
@@ -653,7 +939,7 @@ function App() {
         sections: sections.sort(sectionSort),
       }))
       .sort((a, b) => a.repo.localeCompare(b.repo))
-  }, [library])
+  }, [filteredLibrary])
 
   useEffect(() => {
     if (!allDocs.length) {
@@ -795,10 +1081,10 @@ function App() {
     const files = Array.from(event.target.files || [])
     event.target.value = ''
 
-    const markdownFiles = files.filter((file) => file.name.toLowerCase().endsWith('.md'))
+    const markdownFiles = files.filter((file) => /\.(md|mdx)$/i.test(file.name))
 
     if (!markdownFiles.length) {
-      setError('Please upload markdown files with the .md extension.')
+      setError('Please upload markdown files with .md or .mdx extensions.')
       return
     }
 
@@ -820,6 +1106,10 @@ function App() {
     )
 
     setLibrary((previous) => mergeDocsIntoLibrary(previous, docs))
+    setActiveView('dashboard')
+    setIsSectionsPanelOpen(false)
+    setRepoStatus(`Imported ${docs.length} local file${docs.length === 1 ? '' : 's'}.`)
+    updateSyncMeta(`Imported ${docs.length} local file${docs.length === 1 ? '' : 's'}`)
   }
 
   const pullGitHubRepo = async () => {
@@ -850,6 +1140,7 @@ function App() {
 
       const truncatedNote = markdownCount > importedCount ? ` Imported first ${importedCount} files.` : ''
       setRepoStatus(`Imported ${docs.length} files from ${parsedRepo.owner}/${parsedRepo.repo}.${truncatedNote}`)
+      updateSyncMeta(`Imported ${docs.length} docs from ${parsedRepo.owner}/${parsedRepo.repo}`)
       setActiveView('dashboard')
       setIsSectionsPanelOpen(false)
     } catch (repoError) {
@@ -897,6 +1188,16 @@ function App() {
       return
     }
 
+    const librarySnapshot = library
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(librarySnapshot))
+      writeLibraryToIndexedDb(librarySnapshot).catch(() => {
+        // Best-effort persistence while signing out.
+      })
+    } catch {
+      // Ignore persistence errors during sign-out; docs remain in-memory for this session.
+    }
+
     await supabase.auth.signOut()
     setGithubUser(null)
     setGithubLogin('')
@@ -904,8 +1205,11 @@ function App() {
     setMyRepos([])
     setSelectedRepoNames([])
     setRepoSearchQuery('')
+    setActiveView('dashboard')
+    setLibrary((previous) => (previous.length ? previous : librarySnapshot))
+    hasAttemptedLoginRestoreRef.current = false
     sessionStorage.removeItem(GH_PROVIDER_TOKEN_STORAGE_KEY)
-    setRepoStatus('Disconnected GitHub account.')
+    setRepoStatus('Disconnected GitHub account. Synced docs remain in your local library.')
   }
 
   const loadMyRepos = async ({ preserveSelection = true, statusPrefix = 'Loading your repositories...' } = {}) => {
@@ -1003,6 +1307,7 @@ function App() {
       setRepoStatus(
         `Sync complete. Synced ${syncedRepoCount} repos, imported ${importedDocsCount} docs, skipped ${skippedNoDocsCount} repos with no docs.${failuresSuffix}`,
       )
+      updateSyncMeta(`Synced ${syncedRepoCount} repos and imported ${importedDocsCount} docs`)
     } finally {
       setIsSyncingSelectedRepos(false)
     }
@@ -1058,6 +1363,7 @@ function App() {
 
       const truncatedNote = markdownCount > importedCount ? ` Imported first ${importedCount} files.` : ''
       setRepoStatus(`Fork synced. Imported ${docs.length} files from ${githubLogin}/${parsedRepo.repo}.${truncatedNote}`)
+      updateSyncMeta(`Fork synced ${githubLogin}/${parsedRepo.repo} with ${docs.length} docs`)
     } catch (syncError) {
       setRepoStatus('')
       setError(explainGitHubError(syncError, 'Could not fork and sync this repository.'))
@@ -1071,6 +1377,9 @@ function App() {
     setSelectedDocId('')
     setError('')
     localStorage.removeItem(STORAGE_KEY)
+    deleteLibraryFromIndexedDb().catch(() => {
+      // Ignore clear failures; local state is already reset.
+    })
   }
 
   const exportLibrary = () => {
@@ -1105,6 +1414,347 @@ function App() {
     } catch {
       setError('Could not import library. Use a valid docs-library.json file.')
     }
+  }
+
+  const ensureBackupRepo = async () => {
+    if (!githubLogin) {
+      throw new Error('GitHub username is missing. Disconnect and login again.')
+    }
+
+    try {
+      await githubRequest(`/repos/${githubLogin}/${BACKUP_REPO_NAME}`, githubAccessToken)
+      return
+    } catch (repoCheckError) {
+      const message = repoCheckError instanceof Error ? repoCheckError.message : String(repoCheckError)
+      if (!message.includes('404')) {
+        throw repoCheckError
+      }
+    }
+
+    await githubRequest('/user/repos', githubAccessToken, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: BACKUP_REPO_NAME,
+        private: true,
+        auto_init: true,
+        description: 'Backup repository used by Docs Hub',
+      }),
+    })
+  }
+
+  const backupLibraryToRepo = async (payloadContent) => {
+    await ensureBackupRepo()
+
+    let existingSha = ''
+    try {
+      const existing = await githubRequest(
+        `/repos/${githubLogin}/${BACKUP_REPO_NAME}/contents/${encodeRepoPath(BACKUP_REPO_FILE)}`,
+        githubAccessToken,
+      )
+      existingSha = existing?.sha || ''
+    } catch {
+      existingSha = ''
+    }
+
+    await githubRequest(`/repos/${githubLogin}/${BACKUP_REPO_NAME}/contents/${encodeRepoPath(BACKUP_REPO_FILE)}`, githubAccessToken, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: `Backup docs library at ${new Date().toISOString()}`,
+        content: encodeGitHubContent(payloadContent),
+        ...(existingSha ? { sha: existingSha } : {}),
+      }),
+    })
+  }
+
+  const restoreLibraryFromRepo = async () => {
+    if (!githubLogin) {
+      throw new Error('GitHub username is missing. Disconnect and login again.')
+    }
+
+    const fileData = await githubRequest(
+      `/repos/${githubLogin}/${BACKUP_REPO_NAME}/contents/${encodeRepoPath(BACKUP_REPO_FILE)}`,
+      githubAccessToken,
+    )
+
+    if (!fileData?.content) {
+      throw new Error('Backup file content is empty.')
+    }
+
+    return decodeGitHubContent(fileData.content)
+  }
+
+  const backupLibraryToGitHub = async ({ silent = false } = {}) => {
+    if (!githubAccessToken) {
+      if (!silent) {
+        setError('Login with GitHub first to backup to cloud.')
+      }
+      return false
+    }
+
+    if (!silent) {
+      setError('')
+      setCloudBackupStatus('Saving backup to GitHub...')
+    }
+    setIsBackingUpCloud(true)
+    let isSuccess = false
+
+    try {
+      const payload = {
+        savedAt: new Date().toISOString(),
+        docCount: allDocs.length,
+        library,
+      }
+      const content = JSON.stringify(payload, null, 2)
+
+      await backupLibraryToRepo(content)
+      isSuccess = true
+      setCloudBackupStatus(`${silent ? 'Auto backup' : 'Cloud backup'} saved (${allDocs.length} docs) to backup repository.`)
+    } catch (backupError) {
+      const backupMessage = explainGitHubError(backupError, 'Could not save backup to GitHub.')
+      setCloudBackupStatus(silent ? 'Auto backup failed. You can retry manually.' : backupMessage)
+      if (!silent) {
+        setError(backupMessage)
+      }
+    } finally {
+      setIsBackingUpCloud(false)
+    }
+
+    return isSuccess
+  }
+
+  const restoreLibraryFromGitHub = async ({ silent = false, fromLogin = false } = {}) => {
+    if (!githubAccessToken) {
+      if (!silent) {
+        setError('Login with GitHub first to restore from cloud.')
+      }
+      return
+    }
+
+    if (!silent) {
+      setError('')
+    }
+    setCloudBackupStatus(fromLogin ? 'Login detected. Restoring cloud backup...' : 'Restoring backup from GitHub...')
+    setIsRestoringCloud(true)
+
+    try {
+      const content = await restoreLibraryFromRepo()
+
+      const parsed = JSON.parse(content)
+      const restoredLibrary = Array.isArray(parsed) ? parsed : parsed?.library
+
+      if (!Array.isArray(restoredLibrary)) {
+        throw new Error('Backup format is invalid.')
+      }
+
+      setLibrary(restoredLibrary)
+      setSelectedDocId('')
+      setActiveView('dashboard')
+      setCloudBackupStatus(
+        `Cloud restore complete (${restoredLibrary.flatMap((section) => section.docs || []).length} docs) from backup repository.`,
+      )
+    } catch (restoreError) {
+      const message = restoreError instanceof Error ? restoreError.message.toLowerCase() : ''
+      const isMissingBackup = message.includes('404') || message.includes('not found')
+
+      if (isMissingBackup) {
+        setCloudBackupStatus(fromLogin ? 'No cloud backup found yet. Sync docs and backup to create one.' : 'No cloud backup found yet.')
+      } else {
+        const restoreMessage = explainGitHubError(restoreError, 'Could not restore backup from GitHub.')
+        setCloudBackupStatus(restoreMessage)
+        if (!silent) {
+          setError(restoreMessage)
+        }
+      }
+    } finally {
+      setIsRestoringCloud(false)
+    }
+  }
+
+  const deleteCloudBackupFromGitHub = async () => {
+    if (!githubAccessToken) {
+      setError('Login with GitHub first to manage cloud backups.')
+      return
+    }
+
+    const confirmed = window.confirm('Delete cloud backup from GitHub? This cannot be undone.')
+    if (!confirmed) {
+      return
+    }
+
+    setError('')
+    setCloudBackupStatus('Deleting cloud backup...')
+    setIsDeletingCloudBackup(true)
+
+    try {
+      let deleted = false
+
+      if (githubLogin) {
+        try {
+          const fileData = await githubRequest(
+            `/repos/${githubLogin}/${BACKUP_REPO_NAME}/contents/${encodeRepoPath(BACKUP_REPO_FILE)}`,
+            githubAccessToken,
+          )
+
+          if (fileData?.sha) {
+            await githubRequest(
+              `/repos/${githubLogin}/${BACKUP_REPO_NAME}/contents/${encodeRepoPath(BACKUP_REPO_FILE)}`,
+              githubAccessToken,
+              {
+                method: 'DELETE',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  message: `Delete backup at ${new Date().toISOString()}`,
+                  sha: fileData.sha,
+                }),
+              },
+            )
+            deleted = true
+          }
+        } catch (repoDeleteError) {
+          const message = repoDeleteError instanceof Error ? repoDeleteError.message.toLowerCase() : ''
+          const isMissing = message.includes('404') || message.includes('not found')
+          if (!isMissing) {
+            throw repoDeleteError
+          }
+        }
+      }
+
+      setLastAutoBackupAt('')
+
+      if (deleted) {
+        setCloudBackupStatus('Deleted cloud backup from backup repository.')
+      } else {
+        setCloudBackupStatus('No cloud backup found to delete.')
+      }
+    } catch (deleteError) {
+      const deleteMessage = explainGitHubError(deleteError, 'Could not delete cloud backup.')
+      setCloudBackupStatus(deleteMessage)
+      setError(deleteMessage)
+    } finally {
+      setIsDeletingCloudBackup(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!hasHydratedLibrary || hasAttemptedLoginRestoreRef.current) {
+      return
+    }
+
+    if (!githubUser || !githubAccessToken || isAuthLoading) {
+      return
+    }
+
+    hasAttemptedLoginRestoreRef.current = true
+    restoreLibraryFromGitHub({ silent: true, fromLogin: true }).catch(() => {
+      // Status/error handling is managed inside restoreLibraryFromGitHub.
+    })
+  }, [hasHydratedLibrary, githubUser, githubAccessToken, isAuthLoading])
+
+  useEffect(() => {
+    if (!autoBackupEnabled || !syncMeta.at || !githubUser || !githubAccessToken) {
+      return
+    }
+
+    if (syncMeta.at === lastAutoBackedSyncAtRef.current) {
+      return
+    }
+
+    if (!allDocs.length) {
+      return
+    }
+
+    if (isBackingUpCloud || isRestoringCloud || isDeletingCloudBackup) {
+      return
+    }
+
+    backupLibraryToGitHub({ silent: true })
+      .then((didBackup) => {
+        if (didBackup) {
+          lastAutoBackedSyncAtRef.current = syncMeta.at
+          setLastAutoBackupAt(new Date().toISOString())
+        }
+      })
+      .catch(() => {
+        // Error is reflected in cloudBackupStatus for silent mode.
+      })
+  }, [
+    autoBackupEnabled,
+    syncMeta.at,
+    githubUser,
+    githubAccessToken,
+    allDocs.length,
+    isBackingUpCloud,
+    isRestoringCloud,
+    isDeletingCloudBackup,
+  ])
+
+  if (!githubUser) {
+    return (
+      <div className="login-gate-shell">
+        <section className="login-gate-frame">
+          <div className="login-gate-left">
+            <div className="login-brand-row">
+              <span className="login-brand-mark" aria-hidden="true">
+                <svg className="login-brand-mark-svg" viewBox="0 0 24 24" focusable="false">
+                  <path d="M4 8.5 12 4l8 4.5-8 4.5L4 8.5Z" />
+                  <path d="M4 12.5 12 8l8 4.5-8 4.5-8-4.5Z" opacity="0.75" />
+                  <path d="M4 16.5 12 12l8 4.5-8 4.5-8-4.5Z" opacity="0.55" />
+                </svg>
+              </span>
+              <span className="login-brand-title">Docs Hub</span>
+            </div>
+
+            <h1 className="login-gate-heading">
+              Read smarter.
+              <br />
+              Sync your docs.
+            </h1>
+
+            <p className="login-gate-copy">
+              Markdown + GitHub power. Access your Markdown documentation anywhere with persistent cloud sync.
+            </p>
+
+            <div className="login-feature-list" role="list" aria-label="Key features">
+              <p role="listitem"><span className="login-feature-check">✓</span>Git-based repo sync</p>
+              <p role="listitem"><span className="login-feature-check">✓</span>Offline reading and indexed storage</p>
+              <p role="listitem"><span className="login-feature-check">✓</span>Secure cloud backup</p>
+            </div>
+          </div>
+
+          <div className="login-gate-right">
+            <section className="login-auth-card">
+              <h2 className="login-auth-title">Welcome back</h2>
+              <p className="login-auth-subtitle">Sign in to continue to Docs Hub</p>
+
+              {error ? <p className="error-banner">{error}</p> : null}
+
+              <button
+                className="button button-primary login-cta"
+                onClick={signInWithGitHub}
+                disabled={isStartingGitHubLogin || isAuthLoading || !isSupabaseConfigured}
+              >
+                <span className="login-cta-icon" aria-hidden="true">
+                  <svg className="login-cta-icon-mark" viewBox="0 0 24 24" focusable="false">
+                    <path d="M12 .5C5.73.5.75 5.48.75 11.75c0 5.02 3.25 9.28 7.76 10.78.57.1.78-.25.78-.56 0-.27-.01-1.18-.02-2.14-3.16.69-3.83-1.34-3.83-1.34-.52-1.31-1.26-1.66-1.26-1.66-1.03-.7.08-.69.08-.69 1.14.08 1.74 1.17 1.74 1.17 1.01 1.73 2.65 1.23 3.29.94.1-.73.4-1.23.72-1.51-2.52-.29-5.17-1.26-5.17-5.62 0-1.24.44-2.25 1.17-3.05-.12-.29-.51-1.46.11-3.05 0 0 .95-.3 3.11 1.16a10.86 10.86 0 0 1 5.67 0c2.16-1.46 3.1-1.16 3.1-1.16.62 1.59.23 2.76.12 3.05.73.8 1.16 1.81 1.16 3.05 0 4.37-2.66 5.33-5.19 5.61.41.35.77 1.03.77 2.08 0 1.5-.01 2.71-.01 3.08 0 .31.2.67.79.56a11.26 11.26 0 0 0 7.75-10.78C23.25 5.48 18.27.5 12 .5Z" />
+                  </svg>
+                </span>
+                {isStartingGitHubLogin || isAuthLoading ? 'Preparing login...' : 'Continue with GitHub'}
+              </button>
+
+              <p className="login-auth-note">Secure OAuth. No passwords stored.</p>
+
+              {!isSupabaseConfigured ? (
+                <p className="login-auth-warning">
+                  Supabase auth is not configured. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.
+                </p>
+              ) : null}
+            </section>
+          </div>
+        </section>
+      </div>
+    )
   }
 
   return (
@@ -1157,6 +1807,19 @@ function App() {
                 <span>Local</span>
               </span>
             </button>
+            <button
+              className={`nav-link ${activeView === 'profile' ? 'nav-link-active' : ''}`}
+              type="button"
+              onClick={() => setActiveView('profile')}
+            >
+              <span className="nav-link-inner">
+                <svg className="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <circle cx="12" cy="8" r="3.5" />
+                  <path d="M5 20a7 7 0 0 1 14 0" />
+                </svg>
+                <span>Profile</span>
+              </span>
+            </button>
           </div>
         </section>
 
@@ -1164,10 +1827,22 @@ function App() {
           <>
             <div className="sidebar-header">
               <h2>Sections</h2>
-              <span>{allDocs.length} docs</span>
+              <span>
+                {dashboardSearchQuery.trim() ? `${filteredDocsCount} of ${allDocs.length} docs` : `${allDocs.length} docs`}
+              </span>
               <button className="mobile-close-sections" onClick={() => setIsSectionsPanelOpen(false)}>
                 Close
               </button>
+            </div>
+
+            <div className="sidebar-search-row">
+              <input
+                className="repo-input sidebar-search-input"
+                type="text"
+                value={dashboardSearchQuery}
+                onChange={(event) => setDashboardSearchQuery(event.target.value)}
+                placeholder="Search title, path, section, and content"
+              />
             </div>
 
             {library.length ? (
@@ -1226,14 +1901,20 @@ function App() {
             ) : (
               <p className="placeholder">Upload your markdown notes to generate sections automatically.</p>
             )}
+
+            {library.length && !repoGroups.length ? (
+              <p className="placeholder">No docs matched your search. Try a different keyword.</p>
+            ) : null}
           </>
         ) : (
           <section className="sidebar-info-card">
-            <h3>{activeView === 'git' ? 'Git' : 'Local'}</h3>
+            <h3>{activeView === 'git' ? 'Git' : activeView === 'profile' ? 'Profile' : 'Local'}</h3>
             <p>
               {activeView === 'git'
                 ? 'Pull from GitHub and sync repositories.'
-                : 'Manage local uploads and library storage.'}
+                : activeView === 'profile'
+                  ? 'Manage account security and cloud backup.'
+                  : 'Manage local uploads and library storage.'}
             </p>
           </section>
         )}
@@ -1262,12 +1943,15 @@ function App() {
                   : 'Dashboard'
                 : activeView === 'git'
                   ? 'Git'
-                  : 'Local'}
+                  : activeView === 'profile'
+                    ? 'Profile'
+                    : 'Local'}
             </span>
           </div>
         </header>
 
         {error ? <p className="error-banner">{error}</p> : null}
+        {storageWarning ? <p className="storage-banner">{storageWarning}</p> : null}
 
         <main className="document-panel">
           {activeView === 'dashboard' ? (
@@ -1277,7 +1961,6 @@ function App() {
                   <header className="document-header">
                     <p>{selectedDoc.sourceRepo || getRepoFromSource(selectedDoc.source)}</p>
                     <h2>{selectedDoc.title}</h2>
-                    <span>{selectedDoc.source}</span>
                   </header>
 
                   <div className="markdown-body">
@@ -1306,22 +1989,6 @@ function App() {
                     <p className="eyebrow">Git</p>
                     <h1>Manage Git Docs</h1>
                     <p className="sync-description">Pull from public repos and sync your docs.</p>
-                  </div>
-
-                  <div className="github-auth-row">
-                    {githubUser ? (
-                      <button className="button" onClick={signOutGitHub}>
-                        Disconnect
-                      </button>
-                    ) : (
-                      <button
-                        className="button"
-                        onClick={signInWithGitHub}
-                        disabled={isStartingGitHubLogin || isAuthLoading || !isSupabaseConfigured}
-                      >
-                        {isStartingGitHubLogin ? 'Redirecting...' : 'Login with GitHub'}
-                      </button>
-                    )}
                   </div>
                 </div>
 
@@ -1362,7 +2029,7 @@ function App() {
                         onClick={syncSelectedRepos}
                         disabled={!selectedRepoNames.length || isSyncingSelectedRepos || isLoadingMyRepos}
                       >
-                        {isSyncingSelectedRepos ? 'Syncing selected...' : 'Sync Selected'}
+                        {isSyncingSelectedRepos ? 'Syncing...' : 'Sync'}
                       </button>
                     </div>
 
@@ -1430,6 +2097,13 @@ function App() {
                 ) : null}
 
                 {repoStatus ? <p className="repo-status">{repoStatus}</p> : null}
+
+                <div className="sync-status-panel" role="status" aria-live="polite">
+                  <p className="sync-status-title">Sync status</p>
+                  <p className="sync-status-line">Latest event: {repoStatus || 'Idle'}</p>
+                  <p className="sync-status-line">Last successful sync: {formatDateTime(syncMeta.at)}</p>
+                  {syncMeta.summary ? <p className="sync-status-line">Summary: {syncMeta.summary}</p> : null}
+                </div>
               </section>
             </>
           ) : null}
@@ -1457,7 +2131,7 @@ function App() {
                       <input
                         id="upload-md-settings"
                         type="file"
-                        accept=".md,text/markdown"
+                        accept=".md,.mdx,text/markdown"
                         multiple
                         onChange={onUploadFiles}
                       />
@@ -1507,6 +2181,92 @@ function App() {
             </>
           ) : null}
 
+          {activeView === 'profile' ? (
+            <>
+              <section className="settings-card">
+                <div className="settings-card-header">
+                  <div>
+                    <p className="eyebrow">Account</p>
+                    <h1>Profile</h1>
+                    <p className="settings-description">Manage session, cloud backup, and recovery options.</p>
+                  </div>
+                </div>
+
+                <div className="settings-grid">
+                  <section className="settings-item">
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '12px' }}>
+                      {githubUser?.user_metadata?.avatar_url ? (
+                        <img
+                          src={githubUser.user_metadata.avatar_url}
+                          alt={githubLogin}
+                          style={{
+                            width: '48px',
+                            height: '48px',
+                            borderRadius: '50%',
+                            border: '2px solid #d0d6e8'
+                          }}
+                        />
+                      ) : null}
+                      <div>
+                        <h3>Signed in as</h3>
+                        <p>{githubLogin ? `@${githubLogin}` : 'GitHub account connected'}</p>
+                      </div>
+                    </div>
+                    <div className="settings-actions">
+                      <button className="button button-danger" onClick={signOutGitHub}>
+                        Logout
+                      </button>
+                    </div>
+                  </section>
+                </div>
+
+                <div className="settings-divider" />
+                <h2 className="settings-title">Cloud Backup (GitHub)</h2>
+                <p className="settings-subtitle">Save your library off-device so it can be restored anytime.</p>
+
+                <div className="settings-grid">
+                  <section className="settings-item">
+                    <label className="backup-toggle-row">
+                      <input
+                        type="checkbox"
+                        checked={autoBackupEnabled}
+                        onChange={(event) => setAutoBackupEnabled(event.target.checked)}
+                      />
+                      <span>Auto-backup after successful sync</span>
+                    </label>
+
+                    <div className="settings-actions">
+                      <button
+                        className="button button-primary"
+                        onClick={backupLibraryToGitHub}
+                        disabled={!library.length || isBackingUpCloud || isRestoringCloud || isDeletingCloudBackup}
+                      >
+                        {isBackingUpCloud ? 'Saving...' : 'Backup'}
+                      </button>
+                      <button
+                        className="button"
+                        onClick={restoreLibraryFromGitHub}
+                        disabled={isBackingUpCloud || isRestoringCloud || isDeletingCloudBackup}
+                      >
+                        {isRestoringCloud ? 'Restoring...' : 'Restore'}
+                      </button>
+                      <button
+                        className="button button-danger"
+                        onClick={deleteCloudBackupFromGitHub}
+                        disabled={isBackingUpCloud || isRestoringCloud || isDeletingCloudBackup}
+                      >
+                        {isDeletingCloudBackup ? 'Deleting...' : 'Delete'}
+                      </button>
+                    </div>
+
+                    {lastAutoBackupAt ? <p className="repo-hint">Last auto backup: {formatDateTime(lastAutoBackupAt)}</p> : null}
+                    {cloudBackupStatus ? <p className="repo-hint">{cloudBackupStatus}</p> : null}
+                  </section>
+                </div>
+              </section>
+            </>
+          ) : null}
+
         </main>
       </div>
 
@@ -1518,7 +2278,7 @@ function App() {
             onClick={syncSelectedRepos}
             disabled={!selectedRepoNames.length || isSyncingSelectedRepos || isLoadingMyRepos}
           >
-            {isSyncingSelectedRepos ? 'Syncing selected...' : 'Sync Selected'}
+            {isSyncingSelectedRepos ? 'Syncing...' : 'Sync'}
           </button>
         </div>
       ) : null}
@@ -1544,6 +2304,13 @@ function App() {
           onClick={() => setActiveView('settings')}
         >
           Local
+        </button>
+        <button
+          className={`mobile-bottom-link ${activeView === 'profile' ? 'mobile-bottom-link-active' : ''}`}
+          type="button"
+          onClick={() => setActiveView('profile')}
+        >
+          Profile
         </button>
       </nav>
 
