@@ -293,7 +293,7 @@
   padding: 22px;
   flex: 1;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: center;
   overflow-y: auto;
   min-height: 0;
@@ -586,6 +586,7 @@
 }
 
 .markdown-body {
+  width: 100%;
   margin-top: 18px;
   line-height: 1.74;
   color: var(--text-primary);
@@ -796,7 +797,10 @@
   }
 
   .document-panel {
-    padding: 12px;
+    padding-top: 16px;
+    padding-left: 12px;
+    padding-right: 12px;
+    padding-bottom: 12px;
     flex: 1;
     min-height: 0;
     overflow-y: auto;
@@ -809,6 +813,11 @@
   .help-card {
     border-radius: 12px;
     max-height: none;
+  }
+
+  .reader-card {
+    margin-top: 0;
+    padding: clamp(14px, 2.4vw, 22px);
   }
 
   .button {
@@ -860,8 +869,7 @@
   }
 
   .markdown-body {
-    font-size: 0.95rem;
-    line-height: 1.68;
+    line-height: 1.74;
   }
 
   .document-header h2 {
