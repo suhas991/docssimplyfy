@@ -1,5 +1,5 @@
 const CACHE_NAME = 'docs-hub-v1'
-const APP_SHELL = ['/', '/index.html', '/manifest.webmanifest', '/favicon.svg', '/pwa-192x192.png', '/pwa-512x512.png']
+const APP_SHELL = ['/', '/index.html', '/manifest.webmanifest', '/favicon.svg', '/logoo.png']
 
 self.addEventListener('install', (event) => {
   event.waitUntil(

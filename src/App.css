@@ -4,7 +4,6 @@
   grid-template-columns: 280px 1fr;
   background: var(--panel-bg);
   border: 1px solid var(--border);
-  border-radius: 18px;
   overflow: hidden;
   box-shadow: 0 24px 60px rgba(24, 27, 39, 0.12);
   margin: 0;
@@ -56,6 +55,25 @@
   color: var(--text-primary);
   font-weight: 500;
   cursor: pointer;
+}
+
+.nav-link-inner {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.nav-icon {
+  width: 16px;
+  height: 16px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.8;
+  opacity: 0.8;
+}
+
+.nav-link-active .nav-icon {
+  opacity: 1;
 }
 
 .nav-link:hover {
@@ -277,7 +295,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  overflow: hidden;
+  overflow-y: auto;
   min-height: 0;
 }
 
@@ -293,13 +311,34 @@
   border: 1px solid var(--border);
   border-radius: 16px;
   box-shadow: 0 8px 24px rgba(22, 28, 45, 0.08);
-  max-height: 90vh;
   min-height: 0;
-  overflow-y: auto;
 }
 
 .sync-card {
   padding: 18px;
+}
+
+.git-mode-tabs {
+  margin-top: 12px;
+  display: flex;
+  gap: 8px;
+}
+
+.git-mode-tab {
+  border: 1px solid var(--button-border);
+  background: var(--button-bg);
+  color: var(--button-text);
+  border-radius: 999px;
+  padding: 0.45rem 0.9rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.git-mode-tab-active {
+  background: linear-gradient(135deg, #1e87a8, #5ab8b5);
+  border-color: transparent;
+  color: #fff;
 }
 
 .settings-divider {
@@ -436,17 +475,21 @@
   background: #ffffffb8;
 }
 
-.repo-picker-actions {
+.repo-search-row {
   display: flex;
-  flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
+}
+
+.repo-search-input {
+  min-width: 260px;
 }
 
 .repo-list {
   margin-top: 10px;
   display: grid;
   gap: 6px;
-  max-height: 180px;
+  max-height: 260px;
   overflow-y: auto;
   padding-right: 4px;
 }
@@ -630,6 +673,10 @@
   display: none;
 }
 
+.mobile-sync-bar {
+  display: none;
+}
+
 .mobile-menu-button {
   width: 44px;
   min-width: 44px;
@@ -722,6 +769,10 @@
     flex-direction: column;
   }
 
+  .app-shell.mobile-sync-open .main-shell {
+    padding-bottom: 124px;
+  }
+
   .main-topbar {
     padding: 12px;
     justify-content: flex-start;
@@ -736,7 +787,7 @@
   .mobile-reader-toolbar .mobile-toolbar-title {
     display: block;
     font-weight: 600;
-    font-size: 0.95rem;
+    font-size: 0.9rem;
     flex: 1;
   }
 
@@ -757,8 +808,11 @@
   .settings-card,
   .help-card {
     border-radius: 12px;
-    overflow-y: auto;
-    max-height: 100%;
+    max-height: none;
+  }
+
+  .button {
+    font-size: 0.95rem;
   }
 
   .sync-card-header {
@@ -784,9 +838,30 @@
     align-items: stretch;
   }
 
-  .repo-picker-actions {
+  .repo-search-row {
     flex-direction: column;
     align-items: stretch;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: #ffffffc9;
+    backdrop-filter: blur(2px);
+    padding-bottom: 8px;
+  }
+
+  .repo-sync-inline-btn {
+    display: none;
+  }
+
+  .repo-list {
+    max-height: 42vh;
+    overflow-y: auto;
+    padding-right: 4px;
+  }
+
+  .markdown-body {
+    font-size: 0.95rem;
+    line-height: 1.68;
   }
 
   .document-header h2 {
@@ -814,7 +889,7 @@
     bottom: 0;
     height: 60px;
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(3, 1fr);
     background: #ffffff;
     border-top: 1px solid var(--border);
     z-index: 50;
@@ -827,7 +902,7 @@
     border-top: 3px solid transparent;
     background: transparent;
     color: var(--text-primary);
-    font-size: 0.74rem;
+    font-size: 0.78rem;
     font-weight: 600;
     cursor: pointer;
   }
@@ -836,6 +911,34 @@
     color: var(--button-primary-bg);
     border-top-color: var(--button-primary-bg);
     background: rgba(15, 111, 149, 0.04);
+  }
+
+  .mobile-sync-bar {
+    position: fixed;
+    left: 10px;
+    right: 10px;
+    bottom: 66px;
+    z-index: 60;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    justify-content: space-between;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.95);
+    box-shadow: 0 -2px 12px rgba(24, 27, 39, 0.1);
+    padding: 8px;
+  }
+
+  .mobile-sync-meta {
+    font-size: 0.84rem;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+
+  .mobile-sync-bar .button {
+    font-size: 0.9rem;
+    padding: 0.5rem 0.9rem;
   }
 }
 

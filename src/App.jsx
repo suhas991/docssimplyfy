@@ -14,7 +14,7 @@ function normalizeView(value) {
     return 'git'
   }
 
-  if (value === 'dashboard' || value === 'git' || value === 'settings' || value === 'help') {
+  if (value === 'dashboard' || value === 'git' || value === 'settings') {
     return value
   }
 
@@ -524,11 +524,15 @@ function App() {
   const [githubAccessToken, setGithubAccessToken] = useState('')
   const [myRepos, setMyRepos] = useState([])
   const [selectedRepoNames, setSelectedRepoNames] = useState([])
+  const [repoSearchQuery, setRepoSearchQuery] = useState('')
   const [isLoadingMyRepos, setIsLoadingMyRepos] = useState(false)
   const [isSyncingSelectedRepos, setIsSyncingSelectedRepos] = useState(false)
   const [isAuthLoading, setIsAuthLoading] = useState(true)
   const [isStartingGitHubLogin, setIsStartingGitHubLogin] = useState(false)
   const [isForkSyncing, setIsForkSyncing] = useState(false)
+  const [gitSyncMode, setGitSyncMode] = useState('repos')
+
+  const isMobileSyncBarVisible = activeView === 'git' && gitSyncMode === 'repos' && Boolean(githubUser)
 
   useEffect(() => {
     try {
@@ -655,6 +659,19 @@ function App() {
   const selectedDoc = useMemo(() => {
     return allDocs.find((doc) => doc.id === selectedDocId) || null
   }, [allDocs, selectedDocId])
+
+  const filteredMyRepos = useMemo(() => {
+    const query = repoSearchQuery.trim().toLowerCase()
+    if (!query) {
+      return myRepos
+    }
+
+    return myRepos.filter((repo) => {
+      const fullName = repo.fullName.toLowerCase()
+      const description = String(repo.description || '').toLowerCase()
+      return fullName.includes(query) || description.includes(query)
+    })
+  }, [myRepos, repoSearchQuery])
 
   const docsByRepoAndPath = useMemo(() => {
     const repoMap = new Map()
@@ -875,25 +892,28 @@ function App() {
     setGithubAccessToken('')
     setMyRepos([])
     setSelectedRepoNames([])
+    setRepoSearchQuery('')
     sessionStorage.removeItem(GH_PROVIDER_TOKEN_STORAGE_KEY)
     setRepoStatus('Disconnected GitHub account.')
   }
 
-  const loadMyRepos = async () => {
+  const loadMyRepos = async ({ preserveSelection = true, statusPrefix = 'Loading your repositories...' } = {}) => {
     if (!githubAccessToken) {
       setError('Login with GitHub first.')
       return
     }
 
     setError('')
-    setRepoStatus('Loading your repositories...')
+    setRepoStatus(statusPrefix)
     setIsLoadingMyRepos(true)
 
     try {
       const repos = await fetchUserRepos(githubAccessToken)
       setMyRepos(repos)
-      setSelectedRepoNames([])
-      setRepoStatus(`Loaded ${repos.length} repositories. Select the ones you want to sync.`)
+      setSelectedRepoNames((previous) =>
+        preserveSelection ? previous.filter((name) => repos.some((repo) => repo.fullName === name)) : [],
+      )
+      setRepoStatus(`Loaded ${repos.length} repositories. Search and select repositories to sync.`)
     } catch (reposError) {
       setRepoStatus('')
       setError(explainGitHubError(reposError, 'Could not load repositories from your account.'))
@@ -902,6 +922,18 @@ function App() {
     }
   }
 
+  useEffect(() => {
+    if (!githubUser || !githubAccessToken) {
+      return
+    }
+
+    if (myRepos.length || isLoadingMyRepos) {
+      return
+    }
+
+    loadMyRepos({ preserveSelection: false, statusPrefix: 'Connected. Loading your repositories...' })
+  }, [githubUser, githubAccessToken, myRepos.length, isLoadingMyRepos])
+
   const toggleRepoSelection = (fullName) => {
     setSelectedRepoNames((previous) => {
       if (previous.includes(fullName)) {
@@ -909,14 +941,6 @@ function App() {
       }
       return [...previous, fullName]
     })
-  }
-
-  const selectAllRepos = () => {
-    setSelectedRepoNames(myRepos.map((repo) => repo.fullName))
-  }
-
-  const clearRepoSelection = () => {
-    setSelectedRepoNames([])
   }
 
   const syncSelectedRepos = async () => {
@@ -1073,7 +1097,7 @@ function App() {
   }
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${isMobileSyncBarVisible ? 'mobile-sync-open' : ''}`}>
       <aside className={`sidebar ${isSectionsPanelOpen ? 'open' : ''}`}>
         <div className="sidebar-brand">Docs Hub</div>
 
@@ -1085,28 +1109,42 @@ function App() {
               type="button"
               onClick={() => setActiveView('dashboard')}
             >
-              Dashboard
+              <span className="nav-link-inner">
+                <svg className="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="3" y="3" width="7" height="7" rx="1.5" />
+                  <rect x="14" y="3" width="7" height="11" rx="1.5" />
+                  <rect x="3" y="14" width="7" height="7" rx="1.5" />
+                  <rect x="14" y="18" width="7" height="3" rx="1.5" />
+                </svg>
+                <span>Dashboard</span>
+              </span>
             </button>
             <button
               className={`nav-link ${activeView === 'git' ? 'nav-link-active' : ''}`}
               type="button"
               onClick={() => setActiveView('git')}
             >
-              Git
+              <span className="nav-link-inner">
+                <svg className="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 3 4 11l8 8 8-8-8-8Z" />
+                  <circle cx="9" cy="9" r="1.3" />
+                  <circle cx="12" cy="12" r="1.3" />
+                  <path d="M9.9 9.9 14 14" />
+                </svg>
+                <span>Git</span>
+              </span>
             </button>
             <button
               className={`nav-link ${activeView === 'settings' ? 'nav-link-active' : ''}`}
               type="button"
               onClick={() => setActiveView('settings')}
             >
-              Settings
-            </button>
-            <button
-              className={`nav-link ${activeView === 'help' ? 'nav-link-active' : ''}`}
-              type="button"
-              onClick={() => setActiveView('help')}
-            >
-              Help
+              <span className="nav-link-inner">
+                <svg className="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M3.5 7.5h6l2 2h9v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2v-10a2 2 0 0 1 2-2Z" />
+                </svg>
+                <span>Local</span>
+              </span>
             </button>
           </div>
         </section>
@@ -1180,13 +1218,11 @@ function App() {
           </>
         ) : (
           <section className="sidebar-info-card">
-            <h3>{activeView === 'git' ? 'Git' : activeView === 'settings' ? 'Settings' : 'Help'}</h3>
+            <h3>{activeView === 'git' ? 'Git' : 'Local'}</h3>
             <p>
               {activeView === 'git'
                 ? 'Pull from GitHub and sync repositories.'
-                : activeView === 'settings'
-                  ? 'Configure storage and file import settings.'
-                  : 'See setup steps and usage guidance to onboard quickly.'}
+                : 'Manage local uploads and library storage.'}
             </p>
           </section>
         )}
@@ -1215,9 +1251,7 @@ function App() {
                   : 'Dashboard'
                 : activeView === 'git'
                   ? 'Git'
-                  : activeView === 'settings'
-                  ? 'Settings'
-                : 'Help'}
+                  : 'Local'}
             </span>
           </div>
         </header>
@@ -1266,7 +1300,7 @@ function App() {
                   <div className="github-auth-row">
                     {githubUser ? (
                       <button className="button" onClick={signOutGitHub}>
-                        Disconnect ({githubLogin || 'GitHub'})
+                        Disconnect
                       </button>
                     ) : (
                       <button
@@ -1277,44 +1311,59 @@ function App() {
                         {isStartingGitHubLogin ? 'Redirecting...' : 'Login with GitHub'}
                       </button>
                     )}
-                    <span className="auth-note">
-                      {isSupabaseConfigured
-                        ? githubUser
-                          ? 'GitHub login connected through Supabase.'
-                          : 'Sign in once, then use repository sync controls.'
-                        : 'Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to enable login.'}
-                    </span>
                   </div>
                 </div>
 
-                {githubUser ? (
+                <div className="git-mode-tabs" role="tablist" aria-label="Git sync mode">
+                  <button
+                    type="button"
+                    className={`git-mode-tab ${gitSyncMode === 'repos' ? 'git-mode-tab-active' : ''}`}
+                    onClick={() => setGitSyncMode('repos')}
+                    role="tab"
+                    aria-selected={gitSyncMode === 'repos'}
+                  >
+                    My Repos
+                  </button>
+                  <button
+                    type="button"
+                    className={`git-mode-tab ${gitSyncMode === 'url' ? 'git-mode-tab-active' : ''}`}
+                    onClick={() => setGitSyncMode('url')}
+                    role="tab"
+                    aria-selected={gitSyncMode === 'url'}
+                  >
+                    URL Import
+                  </button>
+                </div>
+
+                {gitSyncMode === 'repos' && githubUser ? (
                   <div className="repo-picker-panel">
-                    <div className="repo-picker-actions">
-                      <button className="button" onClick={loadMyRepos} disabled={isLoadingMyRepos || isSyncingSelectedRepos}>
-                        {isLoadingMyRepos ? 'Loading repos...' : 'Load My Repos'}
-                      </button>
-                      <button className="button" onClick={selectAllRepos} disabled={!myRepos.length || isSyncingSelectedRepos}>
-                        Select all
-                      </button>
+                    <div className="repo-search-row">
+                      <input
+                        className="repo-input repo-search-input"
+                        type="text"
+                        placeholder="Search repositories"
+                        value={repoSearchQuery}
+                        onChange={(event) => setRepoSearchQuery(event.target.value)}
+                        disabled={isLoadingMyRepos || isSyncingSelectedRepos || !myRepos.length}
+                      />
                       <button
-                        className="button"
-                        onClick={clearRepoSelection}
-                        disabled={!selectedRepoNames.length || isSyncingSelectedRepos}
-                      >
-                        Clear selection
-                      </button>
-                      <button
-                        className="button button-primary"
+                        className="button button-primary repo-sync-inline-btn"
                         onClick={syncSelectedRepos}
                         disabled={!selectedRepoNames.length || isSyncingSelectedRepos || isLoadingMyRepos}
                       >
-                        {isSyncingSelectedRepos ? 'Syncing selected...' : 'Sync Selected Repos'}
+                        {isSyncingSelectedRepos ? 'Syncing selected...' : 'Sync Selected'}
                       </button>
                     </div>
 
+                    <p className="repo-hint">
+                      {isLoadingMyRepos
+                        ? 'Loading your repositories...'
+                        : `${selectedRepoNames.length} selected from ${myRepos.length} repos.`}
+                    </p>
+
                     {myRepos.length ? (
                       <div className="repo-list" role="listbox" aria-label="Repository selection">
-                        {myRepos.map((repo) => {
+                        {filteredMyRepos.map((repo) => {
                           const checked = selectedRepoNames.includes(repo.fullName)
                           return (
                             <label key={repo.id} className="repo-item">
@@ -1331,31 +1380,43 @@ function App() {
                         })}
                       </div>
                     ) : (
-                      <p className="repo-hint">Load your repositories, then select multiple and sync docs only.</p>
+                      <p className="repo-hint">Your repositories will load automatically after login.</p>
                     )}
+
+                    {myRepos.length && !filteredMyRepos.length ? (
+                      <p className="repo-hint">No repositories match your search.</p>
+                    ) : null}
                   </div>
                 ) : null}
 
-                <div className="repo-pull-row">
-                  <input
-                    className="repo-input"
-                    type="text"
-                    placeholder="Paste GitHub URL or owner/repo"
-                    value={repoInput}
-                    onChange={(event) => setRepoInput(event.target.value)}
-                    disabled={isPullingRepo || isForkSyncing}
-                  />
-                  <button className="button button-primary" onClick={pullGitHubRepo} disabled={isPullingRepo}>
-                    {isPullingRepo ? 'Pulling...' : 'Pull from GitHub'}
-                  </button>
-                  <button
-                    className="button"
-                    onClick={forkAndSyncRepo}
-                    disabled={isForkSyncing || isStartingGitHubLogin || !repoInput.trim() || !githubUser}
-                  >
-                    {isForkSyncing ? 'Forking...' : 'Fork + Sync to My Account'}
-                  </button>
-                </div>
+                {gitSyncMode === 'repos' && !githubUser ? (
+                  <p className="repo-hint">Login with GitHub to sync from your repositories.</p>
+                ) : null}
+
+                {gitSyncMode === 'url' ? (
+                  <div className="repo-picker-panel">
+                    <div className="repo-pull-row">
+                      <input
+                        className="repo-input"
+                        type="text"
+                        placeholder="Paste GitHub URL or owner/repo"
+                        value={repoInput}
+                        onChange={(event) => setRepoInput(event.target.value)}
+                        disabled={isPullingRepo || isForkSyncing}
+                      />
+                      <button className="button button-primary" onClick={pullGitHubRepo} disabled={isPullingRepo}>
+                        {isPullingRepo ? 'Pulling...' : 'Pull from GitHub'}
+                      </button>
+                      <button
+                        className="button"
+                        onClick={forkAndSyncRepo}
+                        disabled={isForkSyncing || isStartingGitHubLogin || !repoInput.trim() || !githubUser}
+                      >
+                        {isForkSyncing ? 'Forking...' : 'Fork + Sync to My Account'}
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
 
                 {repoStatus ? <p className="repo-status">{repoStatus}</p> : null}
               </section>
@@ -1368,15 +1429,12 @@ function App() {
                 <div className="settings-card-header">
                   <div>
                     <p className="eyebrow">Configuration</p>
-                    <h1>Settings</h1>
-                    <p className="settings-description">Manage your library, import, and export settings.</p>
+                    <h1>Local</h1>
+                    <p className="settings-description">Manage your local library, import, and export tools.</p>
                   </div>
                 </div>
 
                 <div className="settings-divider" />
-                <h2 className="settings-title">Upload Files</h2>
-                <p className="settings-subtitle">Add markdown files and folders from your device.</p>
-
                 <div className="settings-grid">
                   <section className="settings-item">
                     <h3>Uploads</h3>
@@ -1438,29 +1496,21 @@ function App() {
             </>
           ) : null}
 
-          {activeView === 'help' ? (
-            <section className="help-card">
-              <h1>Help</h1>
-              <p>Quick instructions to use the docs hub.</p>
-
-              <ol className="help-list">
-                <li>Use Dashboard as your reading area only.</li>
-                <li>Open Git for login, pull, and repository sync controls.</li>
-                <li>Open Settings for upload, import, and export controls.</li>
-                <li>Use the sidebar to browse repositories, sections, and documents.</li>
-                <li>Use Help for setup and troubleshooting steps anytime.</li>
-              </ol>
-
-              <h3>Troubleshooting</h3>
-              <ul className="help-list">
-                <li>If no docs import, verify the repository contains .md or .mdx files.</li>
-                <li>If login fails, check Supabase GitHub provider configuration.</li>
-                <li>If sync is slow, sync fewer repositories at a time.</li>
-              </ul>
-            </section>
-          ) : null}
         </main>
       </div>
+
+      {isMobileSyncBarVisible ? (
+        <div className="mobile-sync-bar" role="region" aria-label="Mobile sync actions">
+          <span className="mobile-sync-meta">{selectedRepoNames.length} selected</span>
+          <button
+            className="button button-primary"
+            onClick={syncSelectedRepos}
+            disabled={!selectedRepoNames.length || isSyncingSelectedRepos || isLoadingMyRepos}
+          >
+            {isSyncingSelectedRepos ? 'Syncing selected...' : 'Sync Selected'}
+          </button>
+        </div>
+      ) : null}
 
       <nav className="mobile-bottom-nav" aria-label="Mobile navigation">
         <button
@@ -1482,14 +1532,7 @@ function App() {
           type="button"
           onClick={() => setActiveView('settings')}
         >
-          Settings
-        </button>
-        <button
-          className={`mobile-bottom-link ${activeView === 'help' ? 'mobile-bottom-link-active' : ''}`}
-          type="button"
-          onClick={() => setActiveView('help')}
-        >
-          Help
+          Local
         </button>
       </nav>
 
