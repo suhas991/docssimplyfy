@@ -9,6 +9,7 @@ const GH_PROVIDER_TOKEN_STORAGE_KEY = 'docs-site.github-provider-token.v1'
 const VIEW_STORAGE_KEY = 'docs-site.active-view.v1'
 const POST_AUTH_VIEW_KEY = 'docs-site.post-auth-view.v1'
 const SYNC_META_STORAGE_KEY = 'docs-site.sync-meta.v1'
+const READ_DOC_SOURCES_STORAGE_KEY = 'docs-site.read-doc-sources.v1'
 const BACKUP_REPO_NAME = 'docs-hub-backup'
 const BACKUP_REPO_FILE = 'docs-library-backup.json'
 const LIBRARY_DB_NAME = 'docs-site-db'
@@ -125,6 +126,33 @@ function formatDateTime(value) {
   }
 
   return date.toLocaleString()
+}
+
+function getWordCount(value) {
+  const text = String(value || '')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`[^`]*`/g, ' ')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+    .replace(/\[[^\]]*\]\([^)]*\)/g, ' ')
+    .replace(/[#>*_~\-|]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  if (!text) {
+    return 0
+  }
+
+  return text.split(' ').length
+}
+
+function formatReadTimeFromWords(wordCount) {
+  if (!wordCount) {
+    return 'Less than 1 min read'
+  }
+
+  const wordsPerMinute = 220
+  const minutes = Math.max(1, Math.ceil(wordCount / wordsPerMinute))
+  return `${minutes} min read`
 }
 
 function normalizeView(value) {
@@ -712,8 +740,28 @@ function App() {
   const [isStartingGitHubLogin, setIsStartingGitHubLogin] = useState(false)
   const [isForkSyncing, setIsForkSyncing] = useState(false)
   const [gitSyncMode, setGitSyncMode] = useState('repos')
+  const [readingProgress, setReadingProgress] = useState(0)
+  const [progressDocId, setProgressDocId] = useState('')
+  const [readDocSources, setReadDocSources] = useState(() => {
+    try {
+      const cached = localStorage.getItem(READ_DOC_SOURCES_STORAGE_KEY)
+      if (!cached) {
+        return new Set()
+      }
+
+      const parsed = JSON.parse(cached)
+      if (!Array.isArray(parsed)) {
+        return new Set()
+      }
+
+      return new Set(parsed.map((value) => String(value)))
+    } catch {
+      return new Set()
+    }
+  })
   const lastAutoBackedSyncAtRef = useRef(syncMeta.at || '')
   const hasAttemptedLoginRestoreRef = useRef(false)
+  const documentPanelRef = useRef(null)
 
   const isMobileSyncBarVisible = activeView === 'git' && gitSyncMode === 'repos' && Boolean(githubUser)
 
@@ -792,6 +840,10 @@ function App() {
   useEffect(() => {
     localStorage.setItem(SYNC_META_STORAGE_KEY, JSON.stringify(syncMeta))
   }, [syncMeta])
+
+  useEffect(() => {
+    localStorage.setItem(READ_DOC_SOURCES_STORAGE_KEY, JSON.stringify(Array.from(readDocSources)))
+  }, [readDocSources])
 
   useEffect(() => {
     let cancelled = false
@@ -957,6 +1009,94 @@ function App() {
     return allDocs.find((doc) => doc.id === selectedDocId) || null
   }, [allDocs, selectedDocId])
 
+  const selectedDocReadStats = useMemo(() => {
+    const wordCount = getWordCount(selectedDoc?.content || '')
+    return {
+      wordCount,
+      readTimeLabel: formatReadTimeFromWords(wordCount),
+    }
+  }, [selectedDoc])
+
+  useEffect(() => {
+    const panel = documentPanelRef.current
+    if (!panel) {
+      return
+    }
+
+    const resetProgress = () => {
+      setReadingProgress(0)
+      setProgressDocId('')
+    }
+
+    if (activeView !== 'dashboard' || !selectedDoc) {
+      resetProgress()
+      return
+    }
+
+    const updateProgress = () => {
+      setProgressDocId(selectedDoc.id)
+      const totalScrollable = panel.scrollHeight - panel.clientHeight
+      if (totalScrollable <= 0) {
+        setReadingProgress(100)
+        return
+      }
+
+      const nextProgress = Math.min(100, Math.max(0, Math.round((panel.scrollTop / totalScrollable) * 100)))
+      setReadingProgress(nextProgress)
+    }
+
+    panel.scrollTop = 0
+    updateProgress()
+    panel.addEventListener('scroll', updateProgress, { passive: true })
+
+    return () => {
+      panel.removeEventListener('scroll', updateProgress)
+    }
+  }, [activeView, selectedDocId, selectedDoc])
+
+  useEffect(() => {
+    if (activeView !== 'dashboard' || !selectedDoc || readingProgress < 100 || progressDocId !== selectedDoc.id) {
+      return
+    }
+
+    const sourceKey = String(selectedDoc.source || '').trim()
+    if (!sourceKey) {
+      return
+    }
+
+    setReadDocSources((previous) => {
+      if (previous.has(sourceKey)) {
+        return previous
+      }
+
+      const next = new Set(previous)
+      next.add(sourceKey)
+      return next
+    })
+  }, [activeView, selectedDoc, readingProgress, progressDocId])
+
+  const isDocRead = (doc) => {
+    const sourceKey = String(doc?.source || '').trim()
+    return sourceKey ? readDocSources.has(sourceKey) : false
+  }
+
+  const markDocUnread = (doc) => {
+    const sourceKey = String(doc?.source || '').trim()
+    if (!sourceKey) {
+      return
+    }
+
+    setReadDocSources((previous) => {
+      if (!previous.has(sourceKey)) {
+        return previous
+      }
+
+      const next = new Set(previous)
+      next.delete(sourceKey)
+      return next
+    })
+  }
+
   const filteredMyRepos = useMemo(() => {
     const query = repoSearchQuery.trim().toLowerCase()
     if (!query) {
@@ -1072,6 +1212,13 @@ function App() {
           <a {...props} href={href} target={isExternal ? '_blank' : undefined} rel={isExternal ? 'noreferrer' : undefined}>
             {children}
           </a>
+        )
+      },
+      table: ({ children, ...props }) => {
+        return (
+          <div className="markdown-table-wrap">
+            <table {...props}>{children}</table>
+          </div>
         )
       },
     }
@@ -1850,7 +1997,12 @@ function App() {
                 {repoGroups.map((repoGroup) => (
                   <section key={repoGroup.repo} className="repo-block">
                     <h3>{repoGroup.repo}</h3>
-                    {repoGroup.sections.map((section) => (
+                    {repoGroup.sections.map((section) => {
+                      const sectionReadCount = section.docs.reduce((count, doc) => {
+                        return isDocRead(doc) ? count + 1 : count
+                      }, 0)
+
+                      return (
                       <section key={section.id} className="section-block">
                         <button
                           type="button"
@@ -1872,6 +2024,7 @@ function App() {
                         >
                           <span className="section-toggle-title">{section.title}</span>
                           <span className="section-toggle-meta">
+                            <span className="section-toggle-read">{sectionReadCount}/{section.docs.length} read</span>
                             <span className="section-toggle-count">{section.docs.length}</span>
                           </span>
                         </button>
@@ -1880,21 +2033,46 @@ function App() {
                             {section.docs.map((doc) => (
                               <li key={doc.id}>
                                 <button
-                                  className={`doc-link ${selectedDocId === doc.id ? 'active' : ''}`}
+                                  className={`doc-link ${selectedDocId === doc.id ? 'active' : ''} ${isDocRead(doc) ? 'doc-link-read' : ''}`}
                                   onClick={() => {
                                     setActiveView('dashboard')
                                     setSelectedDocId(doc.id)
                                     setIsSectionsPanelOpen(false)
                                   }}
                                 >
-                                  {doc.title}
+                                  <span className="doc-link-content">
+                                    <span className="doc-link-title">{doc.title}</span>
+                                    {isDocRead(doc) ? (
+                                      <span
+                                        className="doc-read-badge"
+                                        role="button"
+                                        tabIndex={0}
+                                        aria-label={`Mark ${doc.title} as unread`}
+                                        onClick={(event) => {
+                                          event.preventDefault()
+                                          event.stopPropagation()
+                                          markDocUnread(doc)
+                                        }}
+                                        onKeyDown={(event) => {
+                                          if (event.key === 'Enter' || event.key === ' ') {
+                                            event.preventDefault()
+                                            event.stopPropagation()
+                                            markDocUnread(doc)
+                                          }
+                                        }}
+                                      >
+                                        Read
+                                      </span>
+                                    ) : null}
+                                  </span>
                                 </button>
                               </li>
                             ))}
                           </ul>
                         ) : null}
                       </section>
-                    ))}
+                      )
+                    })}
                   </section>
                 ))}
               </nav>
@@ -1948,12 +2126,24 @@ function App() {
                     : 'Local'}
             </span>
           </div>
+
+          {activeView === 'dashboard' && selectedDoc ? (
+            <div className="reader-top-meta" aria-live="polite">
+              <div className="reader-progress-line" role="progressbar" aria-valuenow={readingProgress} aria-valuemin={0} aria-valuemax={100}>
+                <span className="reader-progress-fill" style={{ width: `${readingProgress}%` }} />
+              </div>
+              <p className="reader-meta-copy">
+                <span>{selectedDocReadStats.readTimeLabel}</span>
+                <span>{readingProgress}% read</span>
+              </p>
+            </div>
+          ) : null}
         </header>
 
         {error ? <p className="error-banner">{error}</p> : null}
         {storageWarning ? <p className="storage-banner">{storageWarning}</p> : null}
 
-        <main className="document-panel">
+        <main className="document-panel" ref={documentPanelRef}>
           {activeView === 'dashboard' ? (
             <>
               {selectedDoc ? (
@@ -1961,6 +2151,7 @@ function App() {
                   <header className="document-header">
                     <p>{selectedDoc.sourceRepo || getRepoFromSource(selectedDoc.source)}</p>
                     <h2>{selectedDoc.title}</h2>
+                    <span className="document-read-meta">{selectedDocReadStats.readTimeLabel}</span>
                   </header>
 
                   <div className="markdown-body">
