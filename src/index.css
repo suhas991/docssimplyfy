@@ -15,6 +15,9 @@
   --button-border: #b6b2a7;
   --button-text: #273142;
   --button-primary-bg: #0f6f95;
+  --button-primary-start: #2b8dae;
+  --button-primary-end: #63bcb7;
+  --button-primary-shadow: rgba(30, 94, 128, 0.28);
 
   --danger-text: #9f1f2d;
   --danger-border: #d9afb5;

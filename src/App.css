@@ -171,9 +171,9 @@
   min-height: 54px;
   border-radius: 14px;
   padding: 0.72rem 1.2rem;
-  border: 1px solid rgba(230, 239, 250, 0.16);
-  background: linear-gradient(120deg, #26364a 0%, #192738 46%, #101824 100%);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22), 0 16px 30px rgba(11, 17, 28, 0.45);
+  border: 1px solid rgba(93, 163, 189, 0.48);
+  background: linear-gradient(135deg, var(--button-primary-start), var(--button-primary-end));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25), 0 14px 28px var(--button-primary-shadow);
   font-size: 1.03rem;
   letter-spacing: 0.01em;
 }
@@ -540,7 +540,7 @@
 
 .button:hover:not(:disabled) {
   transform: translateY(-1px);
-  box-shadow: 0 10px 22px rgba(19, 28, 51, 0.16);
+  box-shadow: 0 10px 22px rgba(44, 82, 112, 0.18);
 }
 
 .button:disabled {
@@ -549,7 +549,7 @@
 }
 
 .button-primary {
-  background: linear-gradient(135deg, #1e87a8, #5ab8b5);
+  background: linear-gradient(135deg, var(--button-primary-start), var(--button-primary-end));
   color: #fff;
   border-color: transparent;
 }
@@ -623,7 +623,7 @@
 }
 
 .git-mode-tab-active {
-  background: linear-gradient(135deg, #1e87a8, #5ab8b5);
+  background: linear-gradient(135deg, var(--button-primary-start), var(--button-primary-end));
   border-color: transparent;
   color: #fff;
 }
@@ -923,6 +923,14 @@
   margin-top: 18px;
   line-height: 1.74;
   color: var(--text-primary);
+}
+
+.pdf-viewer {
+  width: 100%;
+  min-height: 78vh;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: #fff;
 }
 
 .markdown-body p,
@@ -1286,6 +1294,10 @@
 
   .markdown-body {
     line-height: 1.74;
+  }
+
+  .pdf-viewer {
+    min-height: 64vh;
   }
 
   .markdown-body th,

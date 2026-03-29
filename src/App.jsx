@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { Joyride } from 'react-joyride'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { isSupabaseConfigured, supabase } from './lib/supabase'
@@ -10,12 +11,19 @@ const VIEW_STORAGE_KEY = 'docs-site.active-view.v1'
 const POST_AUTH_VIEW_KEY = 'docs-site.post-auth-view.v1'
 const SYNC_META_STORAGE_KEY = 'docs-site.sync-meta.v1'
 const READ_DOC_SOURCES_STORAGE_KEY = 'docs-site.read-doc-sources.v1'
+const TOUR_DONE_KEY = 'docs-site.tour-done.v1'
+const TOUR_AUTO_SHOWN_KEY = 'docs-site.tour-auto-shown.v1'
+const DESKTOP_TOUR_DONE_KEY = 'docs-site.tour-desktop-done.v1'
+const MOBILE_TOUR_DONE_KEY = 'docs-site.tour-mobile-done.v1'
 const BACKUP_REPO_NAME = 'docs-hub-backup'
 const BACKUP_REPO_FILE = 'docs-library-backup.json'
 const LIBRARY_DB_NAME = 'docs-site-db'
 const LIBRARY_DB_VERSION = 1
 const LIBRARY_STORE_NAME = 'app-state'
 const LIBRARY_STORE_KEY = 'library'
+const SUPPORTED_LOCAL_DOC_PATTERN = /\.(md|mdx|pdf)$/i
+const SUPPORTED_TEXT_DOC_PATTERN = /\.(md|mdx)$/i
+const PDF_DOC_PATTERN = /\.pdf$/i
 
 function openLibraryDb() {
   return new Promise((resolve, reject) => {
@@ -179,7 +187,7 @@ function getFolderName(value) {
 }
 
 function getFileNameWithoutExtension(value) {
-  return value.replace(/\.(md|mdx)$/i, '')
+  return value.replace(/\.(md|mdx|pdf)$/i, '')
 }
 
 function parseOrderPrefix(value) {
@@ -233,6 +241,19 @@ function parseDocLocation(doc) {
   }
 }
 
+function isPdfDoc(doc) {
+  if (!doc) {
+    return false
+  }
+
+  if (String(doc.format || '').toLowerCase() === 'pdf') {
+    return true
+  }
+
+  const sourcePath = String(doc.source || '')
+  return PDF_DOC_PATTERN.test(sourcePath)
+}
+
 function getPathVariants(path) {
   const normalized = normalizeDocPath(path)
   if (!normalized) {
@@ -240,8 +261,8 @@ function getPathVariants(path) {
   }
 
   const basename = normalized.split('/').pop() || normalized
-  const withoutExt = normalized.replace(/\.(md|mdx)$/i, '')
-  const basenameWithoutExt = basename.replace(/\.(md|mdx)$/i, '')
+  const withoutExt = normalized.replace(/\.(md|mdx|pdf)$/i, '')
+  const basenameWithoutExt = basename.replace(/\.(md|mdx|pdf)$/i, '')
 
   return Array.from(new Set([normalized, withoutExt, basename, basenameWithoutExt]))
 }
@@ -466,6 +487,58 @@ function decodeGitHubContent(base64Content) {
   return new TextDecoder('utf-8').decode(bytes)
 }
 
+function decodeGitHubContentToBytes(base64Content) {
+  const sanitized = base64Content.replace(/\n/g, '')
+  return Uint8Array.from(atob(sanitized), (char) => char.charCodeAt(0))
+}
+
+function encodeBytesToBase64(bytes) {
+  let binary = ''
+  const chunkSize = 0x8000
+
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    const chunk = bytes.subarray(index, index + chunkSize)
+    binary += String.fromCharCode(...chunk)
+  }
+
+  return btoa(binary)
+}
+
+function decodeBase64ToBytes(base64Content) {
+  return Uint8Array.from(atob(String(base64Content || '')), (char) => char.charCodeAt(0))
+}
+
+async function fetchGitHubBinaryFromDownloadUrl(downloadUrl, token) {
+  if (!downloadUrl) {
+    return null
+  }
+
+  const response = await fetch(downloadUrl, {
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+  })
+
+  if (!response.ok) {
+    return null
+  }
+
+  return new Uint8Array(await response.arrayBuffer())
+}
+
+async function getFileContent(file) {
+  if (PDF_DOC_PATTERN.test(file.name)) {
+    return ''
+  }
+
+  return file.text()
+}
+
+async function getLocalPdfBase64(file) {
+  const pdfBytes = new Uint8Array(await file.arrayBuffer())
+  return encodeBytesToBase64(pdfBytes)
+}
+
 function encodeGitHubContent(content) {
   const encoded = new TextEncoder().encode(content)
   let binary = ''
@@ -595,16 +668,16 @@ async function fetchMarkdownDocsFromRepo({ owner, repo, token }) {
     token,
   )
 
-  const markdownEntries = (treeData.tree || [])
+  const supportedEntries = (treeData.tree || [])
     .filter((item) => item.type === 'blob')
-    .filter((item) => /\.(md|mdx)$/i.test(item.path))
+    .filter((item) => /\.(md|mdx|pdf)$/i.test(item.path))
 
-  if (!markdownEntries.length) {
-    throw new Error('No markdown files found in this repository.')
+  if (!supportedEntries.length) {
+    throw new Error('No supported files found in this repository (.md, .mdx, .pdf).')
   }
 
   const maxFiles = 120
-  const limitedEntries = markdownEntries.slice(0, maxFiles)
+  const limitedEntries = supportedEntries.slice(0, maxFiles)
 
   const docs = await Promise.all(
     limitedEntries.map(async (entry) => {
@@ -614,17 +687,60 @@ async function fetchMarkdownDocsFromRepo({ owner, repo, token }) {
         token,
       )
 
-      if (!fileData?.content) {
-        throw new Error(`Failed to download ${entry.path}`)
+      let content = ''
+
+      if (PDF_DOC_PATTERN.test(entry.path)) {
+        let pdfBytes = null
+
+        if (fileData?.content) {
+          pdfBytes = decodeGitHubContentToBytes(fileData.content)
+        }
+
+        if (!pdfBytes && entry.sha) {
+          const blobData = await githubRequest(`/repos/${owner}/${repo}/git/blobs/${entry.sha}`, token)
+          if (blobData?.content) {
+            pdfBytes = decodeGitHubContentToBytes(blobData.content)
+          }
+        }
+
+        if (!pdfBytes && fileData?.download_url) {
+          pdfBytes = await fetchGitHubBinaryFromDownloadUrl(fileData.download_url, token)
+        }
+
+        if (!pdfBytes) {
+          throw new Error(`Failed to download ${entry.path}`)
+        }
+
+        content = ''
+        const pdfBase64 = encodeBytesToBase64(pdfBytes)
+
+        return {
+          id: `${toSlug(entry.path)}-${crypto.randomUUID()}`,
+          title: getTitleFromPath(entry.path),
+          section: getSectionFromPath(entry.path),
+          sourceRepo: `${owner}/${repo}`,
+          source: `github:${owner}/${repo}/${entry.path}`,
+          format: 'pdf',
+          mimeType: 'application/pdf',
+          pdfBase64,
+          content,
+          updatedAt: new Date().toISOString(),
+        }
+      } else {
+        if (!fileData?.content) {
+          throw new Error(`Failed to download ${entry.path}`)
+        }
+
+        content = decodeGitHubContent(fileData.content)
       }
 
-      const content = decodeGitHubContent(fileData.content)
       return {
         id: `${toSlug(entry.path)}-${crypto.randomUUID()}`,
         title: getTitleFromPath(entry.path),
         section: getSectionFromPath(entry.path),
         sourceRepo: `${owner}/${repo}`,
         source: `github:${owner}/${repo}/${entry.path}`,
+        format: 'markdown',
         content,
         updatedAt: new Date().toISOString(),
       }
@@ -633,7 +749,7 @@ async function fetchMarkdownDocsFromRepo({ owner, repo, token }) {
 
   return {
     docs,
-    markdownCount: markdownEntries.length,
+    markdownCount: supportedEntries.length,
     importedCount: limitedEntries.length,
   }
 }
@@ -691,6 +807,83 @@ function docSort(a, b) {
   return compareBySourceName(a.title || '', b.title || '')
 }
 
+function getDesktopTourSteps() {
+  return [
+    {
+      target: '.sidebar-nav-list .nav-link:nth-child(1)',
+      content: 'Dashboard: read documents, track progress, and continue your current reading flow.',
+      disableBeacon: true,
+      placement: 'right',
+    },
+    {
+      target: '.sidebar-nav-list .nav-link:nth-child(2)',
+      content: 'Git: connect GitHub and sync markdown docs from repositories.',
+      placement: 'right',
+    },
+    {
+      target: '.sidebar-nav-list .nav-link:nth-child(3)',
+      content: 'Local: upload files/folders, import/export library, and manage local storage.',
+      placement: 'right',
+    },
+    {
+      target: '.sidebar-nav-list .nav-link:nth-child(4)',
+      content: 'Profile: manage account session, cloud backup, restore, and replay tour.',
+      placement: 'right',
+    },
+    {
+      target: '.sidebar-search-input',
+      content: 'Search docs instantly by title, section, source, and content.',
+      placement: 'right',
+    },
+    {
+      target: '.main-topbar',
+      content: 'Your reading progress and top-level context are shown here while reading.',
+      placement: 'bottom',
+    },
+    {
+      target: '.document-panel',
+      content: 'Read your markdown content here with responsive tables, links, and progress tracking.',
+      placement: 'center',
+    },
+  ]
+}
+
+function getMobileTourSteps() {
+  return [
+    {
+      target: '.mobile-bottom-nav .mobile-bottom-link:nth-child(1)',
+      content: 'Dashboard: open and read your docs.',
+      disableBeacon: true,
+      placement: 'top',
+    },
+    {
+      target: '.mobile-bottom-nav .mobile-bottom-link:nth-child(2)',
+      content: 'Git: sync from GitHub repositories.',
+      placement: 'top',
+    },
+    {
+      target: '.mobile-bottom-nav .mobile-bottom-link:nth-child(3)',
+      content: 'Local: upload, import/export, and manage local docs.',
+      placement: 'top',
+    },
+    {
+      target: '.mobile-bottom-nav .mobile-bottom-link:nth-child(4)',
+      content: 'Profile: account, cloud backup, and restore controls.',
+      placement: 'top',
+    },
+    {
+      target: '.mobile-menu-button',
+      content: 'Tap this menu button to open sections and pick documents.',
+      placement: 'bottom',
+    },
+    {
+      target: '.document-panel',
+      content: 'This is your reading area. Scroll to track progress and mark docs as read.',
+      placement: 'center',
+    },
+  ]
+}
+
 function App() {
   const [activeView, setActiveView] = useState(() => {
     return normalizeView(localStorage.getItem(VIEW_STORAGE_KEY))
@@ -740,6 +933,9 @@ function App() {
   const [isStartingGitHubLogin, setIsStartingGitHubLogin] = useState(false)
   const [isForkSyncing, setIsForkSyncing] = useState(false)
   const [gitSyncMode, setGitSyncMode] = useState('repos')
+  const [isTourRunning, setIsTourRunning] = useState(false)
+  const [tourSteps, setTourSteps] = useState([])
+  const [isMobileViewport, setIsMobileViewport] = useState(() => window.matchMedia('(max-width: 1024px)').matches)
   const [readingProgress, setReadingProgress] = useState(0)
   const [progressDocId, setProgressDocId] = useState('')
   const [readDocSources, setReadDocSources] = useState(() => {
@@ -761,6 +957,8 @@ function App() {
   })
   const lastAutoBackedSyncAtRef = useRef(syncMeta.at || '')
   const hasAttemptedLoginRestoreRef = useRef(false)
+  const hasStartedTourRef = useRef(false)
+  const tourStartTimeoutRef = useRef(null)
   const documentPanelRef = useRef(null)
 
   const isMobileSyncBarVisible = activeView === 'git' && gitSyncMode === 'repos' && Boolean(githubUser)
@@ -771,6 +969,30 @@ function App() {
       at: new Date().toISOString(),
     })
   }
+
+  const startOnboardingTour = () => {
+    if (tourStartTimeoutRef.current) {
+      window.clearTimeout(tourStartTimeoutRef.current)
+    }
+
+    setActiveView('dashboard')
+    setTourSteps(isMobileViewport ? getMobileTourSteps() : getDesktopTourSteps())
+    setIsTourRunning(false)
+
+    // Wait for the dashboard DOM to paint before Joyride resolves targets.
+    tourStartTimeoutRef.current = window.setTimeout(() => {
+      setIsTourRunning(true)
+      tourStartTimeoutRef.current = null
+    }, 180)
+  }
+
+  useEffect(() => {
+    return () => {
+      if (tourStartTimeoutRef.current) {
+        window.clearTimeout(tourStartTimeoutRef.current)
+      }
+    }
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -844,6 +1066,21 @@ function App() {
   useEffect(() => {
     localStorage.setItem(READ_DOC_SOURCES_STORAGE_KEY, JSON.stringify(Array.from(readDocSources)))
   }, [readDocSources])
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia('(max-width: 1024px)')
+
+    const updateViewport = () => {
+      setIsMobileViewport(mediaQuery.matches)
+    }
+
+    updateViewport()
+    mediaQuery.addEventListener('change', updateViewport)
+
+    return () => {
+      mediaQuery.removeEventListener('change', updateViewport)
+    }
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -945,6 +1182,39 @@ function App() {
     }
   }, [])
 
+  useEffect(() => {
+    if (!githubUser || isAuthLoading || hasStartedTourRef.current) {
+      return
+    }
+
+    const hasLegacyDone = localStorage.getItem(DESKTOP_TOUR_DONE_KEY) === '1' || localStorage.getItem(MOBILE_TOUR_DONE_KEY) === '1'
+    if (hasLegacyDone && localStorage.getItem(TOUR_DONE_KEY) !== '1') {
+      localStorage.setItem(TOUR_DONE_KEY, '1')
+    }
+
+    const hasAutoShown = localStorage.getItem(TOUR_AUTO_SHOWN_KEY) === '1'
+    if (hasAutoShown || localStorage.getItem(TOUR_DONE_KEY) === '1') {
+      if (!hasAutoShown && localStorage.getItem(TOUR_DONE_KEY) === '1') {
+        localStorage.setItem(TOUR_AUTO_SHOWN_KEY, '1')
+      }
+      return
+    }
+
+    hasStartedTourRef.current = true
+    localStorage.setItem(TOUR_AUTO_SHOWN_KEY, '1')
+    startOnboardingTour()
+  }, [githubUser, isAuthLoading, isMobileViewport])
+
+  const onTourCallback = (data) => {
+    const status = String(data?.status || '')
+    const action = String(data?.action || '')
+
+    if (status === 'finished' || status === 'skipped' || action === 'close') {
+      localStorage.setItem(TOUR_DONE_KEY, '1')
+      setIsTourRunning(false)
+    }
+  }
+
   const allDocs = useMemo(() => {
     return library.flatMap((section) => section.docs)
   }, [library])
@@ -1009,7 +1279,33 @@ function App() {
     return allDocs.find((doc) => doc.id === selectedDocId) || null
   }, [allDocs, selectedDocId])
 
+  const [selectedPdfUrl, setSelectedPdfUrl] = useState('')
+
+  useEffect(() => {
+    if (!selectedDoc || !isPdfDoc(selectedDoc) || !selectedDoc.pdfBase64) {
+      setSelectedPdfUrl('')
+      return
+    }
+
+    const pdfBytes = decodeBase64ToBytes(selectedDoc.pdfBase64)
+    const blob = new Blob([pdfBytes], { type: selectedDoc.mimeType || 'application/pdf' })
+    const objectUrl = URL.createObjectURL(blob)
+    setSelectedPdfUrl(objectUrl)
+
+    return () => {
+      URL.revokeObjectURL(objectUrl)
+      setSelectedPdfUrl('')
+    }
+  }, [selectedDoc])
+
   const selectedDocReadStats = useMemo(() => {
+    if (isPdfDoc(selectedDoc)) {
+      return {
+        wordCount: 0,
+        readTimeLabel: 'PDF document',
+      }
+    }
+
     const wordCount = getWordCount(selectedDoc?.content || '')
     return {
       wordCount,
@@ -1030,6 +1326,12 @@ function App() {
 
     if (activeView !== 'dashboard' || !selectedDoc) {
       resetProgress()
+      return
+    }
+
+    if (isPdfDoc(selectedDoc)) {
+      setProgressDocId(selectedDoc.id)
+      setReadingProgress(100)
       return
     }
 
@@ -1228,35 +1530,57 @@ function App() {
     const files = Array.from(event.target.files || [])
     event.target.value = ''
 
-    const markdownFiles = files.filter((file) => /\.(md|mdx)$/i.test(file.name))
+    const supportedFiles = files.filter((file) => SUPPORTED_LOCAL_DOC_PATTERN.test(file.name))
 
-    if (!markdownFiles.length) {
-      setError('Please upload markdown files with .md or .mdx extensions.')
+    if (!supportedFiles.length) {
+      setError('Please upload supported files with .md, .mdx, or .pdf extensions.')
       return
     }
 
     setError('')
 
-    const docs = await Promise.all(
-      markdownFiles.map(async (file) => {
-        const content = await file.text()
-        return {
-          id: `${toSlug(file.name)}-${crypto.randomUUID()}`,
-          title: getTitleFromFile(file),
-          section: getSectionFromFile(file),
-          sourceRepo: 'Local Uploads',
-          source: file.webkitRelativePath || file.name,
-          content,
-          updatedAt: new Date().toISOString(),
-        }
-      }),
-    )
+    try {
+      const docs = await Promise.all(
+        supportedFiles.map(async (file) => {
+          const content = await getFileContent(file)
 
-    setLibrary((previous) => mergeDocsIntoLibrary(previous, docs))
-    setActiveView('dashboard')
-    setIsSectionsPanelOpen(false)
-    setRepoStatus(`Imported ${docs.length} local file${docs.length === 1 ? '' : 's'}.`)
-    updateSyncMeta(`Imported ${docs.length} local file${docs.length === 1 ? '' : 's'}`)
+          if (PDF_DOC_PATTERN.test(file.name)) {
+            return {
+              id: `${toSlug(file.name)}-${crypto.randomUUID()}`,
+              title: getTitleFromFile(file),
+              section: getSectionFromFile(file),
+              sourceRepo: 'Local Uploads',
+              source: file.webkitRelativePath || file.name,
+              format: 'pdf',
+              mimeType: file.type || 'application/pdf',
+              pdfBase64: await getLocalPdfBase64(file),
+              content,
+              updatedAt: new Date().toISOString(),
+            }
+          }
+
+          return {
+            id: `${toSlug(file.name)}-${crypto.randomUUID()}`,
+            title: getTitleFromFile(file),
+            section: getSectionFromFile(file),
+            sourceRepo: 'Local Uploads',
+            source: file.webkitRelativePath || file.name,
+            format: 'markdown',
+            content,
+            updatedAt: new Date().toISOString(),
+          }
+        }),
+      )
+
+      setLibrary((previous) => mergeDocsIntoLibrary(previous, docs))
+      setActiveView('dashboard')
+      setIsSectionsPanelOpen(false)
+      setRepoStatus(`Imported ${docs.length} local file${docs.length === 1 ? '' : 's'}.`)
+      updateSyncMeta(`Imported ${docs.length} local file${docs.length === 1 ? '' : 's'}`)
+    } catch (uploadError) {
+      console.error(uploadError)
+      setError('Failed to parse one or more files. Check the file and try again.')
+    }
   }
 
   const pullGitHubRepo = async () => {
@@ -1906,6 +2230,32 @@ function App() {
 
   return (
     <div className={`app-shell ${isMobileSyncBarVisible ? 'mobile-sync-open' : ''}`}>
+      <Joyride
+        steps={tourSteps}
+        run={isTourRunning}
+        continuous
+        showSkipButton
+        showProgress
+        disableScrollParentFix
+        scrollToFirstStep
+        callback={onTourCallback}
+        styles={{
+          options: {
+            zIndex: 10000,
+            primaryColor: '#1e87a8',
+            textColor: '#1f2a3c',
+            width: isMobileViewport ? 300 : 380,
+          },
+        }}
+        locale={{
+          back: 'Back',
+          close: 'Close',
+          last: 'Done',
+          next: 'Next',
+          skip: 'Skip',
+        }}
+      />
+
       <aside className={`sidebar ${isSectionsPanelOpen ? 'open' : ''}`}>
         <div className="sidebar-brand">Docs Hub</div>
 
@@ -2077,7 +2427,7 @@ function App() {
                 ))}
               </nav>
             ) : (
-              <p className="placeholder">Upload your markdown notes to generate sections automatically.</p>
+              <p className="placeholder">Upload markdown or PDF notes to generate sections automatically.</p>
             )}
 
             {library.length && !repoGroups.length ? (
@@ -2155,16 +2505,32 @@ function App() {
                   </header>
 
                   <div className="markdown-body">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-                      {selectedDoc.content}
-                    </ReactMarkdown>
+                    {isPdfDoc(selectedDoc) ? (
+                      selectedPdfUrl ? (
+                        <iframe
+                          className="pdf-viewer"
+                          src={selectedPdfUrl}
+                          title={selectedDoc.title}
+                        />
+                      ) : selectedDoc.pdfBase64 ? (
+                        <p className="placeholder">Loading PDF preview...</p>
+                      ) : (
+                        <p className="placeholder">
+                          PDF binary is not available in this record. Re-import this PDF to open it in the PDF viewer.
+                        </p>
+                      )
+                    ) : (
+                      <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                        {selectedDoc.content}
+                      </ReactMarkdown>
+                    )}
                   </div>
                 </article>
               ) : (
                 <div className="empty-state">
                   <h2>Your docs hub is ready</h2>
                   <p>
-                    Start by uploading markdown files. Folder uploads preserve structure, so each top-level folder
+                    Start by uploading markdown or PDF files. Folder uploads preserve structure, so each top-level folder
                     becomes a section.
                   </p>
                 </div>
@@ -2314,15 +2680,15 @@ function App() {
                 <div className="settings-grid">
                   <section className="settings-item">
                     <h3>Uploads</h3>
-                    <p>Add markdown files and folders from your device.</p>
+                    <p>Add markdown or PDF files and folders from your device.</p>
                     <div className="settings-actions">
                       <label className="button button-primary" htmlFor="upload-md-settings">
-                        Upload .md files
+                        Upload docs
                       </label>
                       <input
                         id="upload-md-settings"
                         type="file"
-                        accept=".md,.mdx,text/markdown"
+                        accept=".md,.mdx,.pdf,text/markdown,application/pdf"
                         multiple
                         onChange={onUploadFiles}
                       />
@@ -2332,6 +2698,7 @@ function App() {
                       <input
                         id="upload-folder-settings"
                         type="file"
+                        accept=".md,.mdx,.pdf,text/markdown,application/pdf"
                         multiple
                         webkitdirectory=""
                         directory=""
@@ -2406,6 +2773,9 @@ function App() {
                     <div className="settings-actions">
                       <button className="button button-danger" onClick={signOutGitHub}>
                         Logout
+                      </button>
+                      <button className="button" onClick={startOnboardingTour}>
+                        Replay Tour
                       </button>
                     </div>
                   </section>
