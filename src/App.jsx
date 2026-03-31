@@ -1500,7 +1500,7 @@ function getDesktopTourSteps() {
     },
     {
       target: '.topbar-profile-button',
-      content: 'Profile: manage account session, cloud backup, restore, and replay tour.',
+      content: 'Profile: use this top-right avatar to open account, cloud backup, restore, and replay tour controls.',
       placement: 'bottom',
     },
     {
@@ -1546,7 +1546,7 @@ function getMobileTourSteps() {
     },
     {
       target: '.topbar-profile-button',
-      content: 'Profile: account, cloud backup, and restore controls.',
+      content: 'Profile: tap this top-right avatar for account, cloud backup, and restore controls.',
       placement: 'left',
     },
     {
