@@ -1292,6 +1292,18 @@ function explainGitHubError(error, fallbackMessage) {
     return 'GitHub token is invalid. Create a new token and try again.'
   }
 
+  if (lowerMessage.includes('no supported files found')) {
+    return 'No Markdown or PDF files were found in this repository. URL import supports .md, .mdx, and .pdf files.'
+  }
+
+  if (lowerMessage.includes('git repository is empty') || lowerMessage.includes('repository is empty')) {
+    return 'This repository is empty. Add .md, .mdx, or .pdf files and retry.'
+  }
+
+  if (lowerMessage.includes('invalid object requested') || lowerMessage.includes('no commit found')) {
+    return 'Could not read the default branch for this repository. Verify the repository URL and branch visibility.'
+  }
+
   if (msg.includes('rate limit')) {
     return 'GitHub rate limit reached. Try again in an hour or use a token with higher limits.'
   }
@@ -1324,7 +1336,7 @@ function explainGitHubError(error, fallbackMessage) {
     return `Could not reach GitHub. Error: ${msg}. Ensure GitHub API is accessible.`
   }
 
-  return fallbackMessage
+  return `${fallbackMessage} ${msg}`
 }
 
 async function fetchMarkdownDocsFromRepo({ owner, repo, token }) {
@@ -1341,7 +1353,7 @@ async function fetchMarkdownDocsFromRepo({ owner, repo, token }) {
     .filter((item) => /\.(md|mdx|pdf)$/i.test(item.path))
 
   if (!supportedEntries.length) {
-    throw new Error('No supported files found in this repository (.md, .mdx, .pdf).')
+    throw new Error('No Markdown or PDF files found in this repository (.md, .mdx, .pdf).')
   }
 
   const maxFiles = 120
@@ -1494,9 +1506,9 @@ function getDesktopTourSteps() {
       placement: 'right',
     },
     {
-      target: '.sidebar-nav-list .nav-link:nth-child(4)',
-      content: 'AI Assistant: ask questions and retrieve grounded context from your docs.',
-      placement: 'right',
+      target: '.chat-fab-button',
+      content: 'Chat: use this floating circular icon to open AI Assistant with grounded context from your docs.',
+      placement: 'left',
     },
     {
       target: '.topbar-profile-button',
@@ -1540,8 +1552,8 @@ function getMobileTourSteps() {
       placement: 'top',
     },
     {
-      target: '.mobile-bottom-nav .mobile-bottom-link:nth-child(4)',
-      content: 'AI Assistant: ask questions grounded in your synced and local docs.',
+      target: '.chat-fab-button',
+      content: 'Chat: tap this floating circular icon to open grounded AI chat for your docs.',
       placement: 'top',
     },
     {
@@ -3399,18 +3411,6 @@ function App() {
                 <span>Local</span>
               </span>
             </button>
-            <button
-              className={`nav-link ${activeView === 'chat' ? 'nav-link-active' : ''}`}
-              type="button"
-              onClick={() => setActiveView('chat')}
-            >
-              <span className="nav-link-inner">
-                <svg className="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M5 5h14a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-5l-4 3v-3H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z" />
-                </svg>
-                <span>AI Assistant</span>
-              </span>
-            </button>
           </div>
         </section>
 
@@ -4074,6 +4074,20 @@ function App() {
           ) : null}
 
         </main>
+
+        {activeView === 'dashboard' ? (
+          <button
+            className="chat-fab-button"
+            type="button"
+            onClick={() => setActiveView('chat')}
+            aria-label="Open AI Assistant"
+            title="Open AI Assistant"
+          >
+            <svg className="chat-fab-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M5 5h14a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-5l-4 3v-3H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z" />
+            </svg>
+          </button>
+        ) : null}
       </div>
 
       {isMobileSyncBarVisible ? (
@@ -4110,13 +4124,6 @@ function App() {
           onClick={() => setActiveView('settings')}
         >
           Local
-        </button>
-        <button
-          className={`mobile-bottom-link ${activeView === 'chat' ? 'mobile-bottom-link-active' : ''}`}
-          type="button"
-          onClick={() => setActiveView('chat')}
-        >
-          Chat
         </button>
       </nav>
 

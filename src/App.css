@@ -574,6 +574,38 @@
   gap: 10px;
 }
 
+.chat-fab-button {
+  position: fixed;
+  right: 22px;
+  bottom: 20px;
+  z-index: 58;
+  border: 1px solid rgba(93, 163, 189, 0.48);
+  border-radius: 999px;
+  width: 50px;
+  height: 50px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: #ffffff;
+  background: linear-gradient(135deg, var(--button-primary-start), var(--button-primary-end));
+  box-shadow: 0 12px 26px rgba(24, 69, 96, 0.3);
+}
+
+.chat-fab-button:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 16px 30px rgba(24, 69, 96, 0.34);
+}
+
+.chat-fab-icon {
+  width: 20px;
+  height: 20px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+}
+
 .button {
   border: 1px solid var(--button-border);
   border-radius: 999px;
@@ -1571,6 +1603,17 @@
     height: 38px;
   }
 
+  .chat-fab-button {
+    right: 12px;
+    bottom: calc(68px + env(safe-area-inset-bottom, 0px));
+    width: 46px;
+    height: 46px;
+  }
+
+  .app-shell.mobile-sync-open .chat-fab-button {
+    bottom: calc(132px + env(safe-area-inset-bottom, 0px));
+  }
+
   .document-panel {
     padding-top: 16px;
     padding-left: 12px;
@@ -1829,7 +1872,7 @@
     bottom: 0;
     height: 60px;
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(3, 1fr);
     background: #ffffff;
     border-top: 1px solid var(--border);
     z-index: 50;
