@@ -1,9 +1,25 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { Joyride } from 'react-joyride'
+import { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { isSupabaseConfigured, supabase } from './lib/supabase'
 import './App.css'
+
+const Joyride = lazy(() => import('react-joyride').then((module) => ({ default: module.Joyride })))
+
+let pdfJsPromise = null
+
+async function loadPdfJs() {
+  if (!pdfJsPromise) {
+    pdfJsPromise = Promise.all([import('pdfjs-dist'), import('pdfjs-dist/build/pdf.worker.min.mjs?url')]).then(
+      ([pdfJsModule, workerModule]) => {
+        pdfJsModule.GlobalWorkerOptions.workerSrc = workerModule.default
+        return pdfJsModule
+      },
+    )
+  }
+
+  return pdfJsPromise
+}
 
 const STORAGE_KEY = 'docs-site.library.v1'
 const GH_PROVIDER_TOKEN_STORAGE_KEY = 'docs-site.github-provider-token.v1'
@@ -18,12 +34,36 @@ const MOBILE_TOUR_DONE_KEY = 'docs-site.tour-mobile-done.v1'
 const BACKUP_REPO_NAME = 'docs-hub-backup'
 const BACKUP_REPO_FILE = 'docs-library-backup.json'
 const LIBRARY_DB_NAME = 'docs-site-db'
-const LIBRARY_DB_VERSION = 1
+const LIBRARY_DB_VERSION = 3
 const LIBRARY_STORE_NAME = 'app-state'
 const LIBRARY_STORE_KEY = 'library'
+const RAG_CHUNKS_STORE_NAME = 'rag_chunks'
+const RAG_EMBEDDINGS_STORE_NAME = 'rag_embeddings'
+const RAG_META_STORE_NAME = 'rag_meta'
+const RAG_META_KEY = 'index-meta'
+const RAG_EMBED_META_KEY = 'embedding-meta'
+const GEMINI_EMBEDDING_MODEL = import.meta.env.VITE_GEMINI_EMBED_MODEL || 'gemini-embedding-001'
+const GEMINI_EMBEDDING_API_KEY = import.meta.env.VITE_GEMINI_API_KEY || ''
+const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_KEY || ''
+const GROQ_CHAT_MODEL = import.meta.env.VITE_GROQ_CHAT_MODEL || 'llama-3.3-70b-versatile'
+const LOCAL_EMBEDDING_MODEL = 'all-MiniLM-L6-v2'
+const LOCAL_EMBEDDING_MODEL_ID = 'Xenova/all-MiniLM-L6-v2'
+const GEMINI_RATE_LIMIT_COOLDOWN_MS = 10 * 60 * 1000
+const EMBEDDING_FLUSH_BATCH_SIZE = 20
 const SUPPORTED_LOCAL_DOC_PATTERN = /\.(md|mdx|pdf)$/i
 const SUPPORTED_TEXT_DOC_PATTERN = /\.(md|mdx)$/i
 const PDF_DOC_PATTERN = /\.pdf$/i
+
+let miniLmEmbedderPromise = null
+let geminiRateLimitedUntilMs = 0
+
+function createClientId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+}
 
 function openLibraryDb() {
   return new Promise((resolve, reject) => {
@@ -38,6 +78,23 @@ function openLibraryDb() {
       const db = request.result
       if (!db.objectStoreNames.contains(LIBRARY_STORE_NAME)) {
         db.createObjectStore(LIBRARY_STORE_NAME, { keyPath: 'key' })
+      }
+
+      if (!db.objectStoreNames.contains(RAG_CHUNKS_STORE_NAME)) {
+        const chunkStore = db.createObjectStore(RAG_CHUNKS_STORE_NAME, { keyPath: 'chunkId' })
+        chunkStore.createIndex('docId', 'docId', { unique: false })
+        chunkStore.createIndex('hash', 'hash', { unique: false })
+      }
+
+      if (!db.objectStoreNames.contains(RAG_EMBEDDINGS_STORE_NAME)) {
+        const embeddingStore = db.createObjectStore(RAG_EMBEDDINGS_STORE_NAME, { keyPath: 'chunkId' })
+        embeddingStore.createIndex('hash', 'hash', { unique: false })
+        embeddingStore.createIndex('model', 'model', { unique: false })
+        embeddingStore.createIndex('modelHash', 'modelHash', { unique: false })
+      }
+
+      if (!db.objectStoreNames.contains(RAG_META_STORE_NAME)) {
+        db.createObjectStore(RAG_META_STORE_NAME, { keyPath: 'key' })
       }
     }
 
@@ -123,6 +180,559 @@ async function deleteLibraryFromIndexedDb() {
   })
 }
 
+async function writeRagChunksToIndexedDb(chunks, meta = {}) {
+  const db = await openLibraryDb()
+  if (!db) {
+    return
+  }
+
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([RAG_CHUNKS_STORE_NAME, RAG_META_STORE_NAME], 'readwrite')
+    const chunkStore = transaction.objectStore(RAG_CHUNKS_STORE_NAME)
+    const metaStore = transaction.objectStore(RAG_META_STORE_NAME)
+
+    chunkStore.clear()
+    for (const chunk of chunks) {
+      chunkStore.put(chunk)
+    }
+
+    metaStore.put({
+      key: RAG_META_KEY,
+      chunkCount: chunks.length,
+      indexedAt: new Date().toISOString(),
+      ...meta,
+    })
+
+    transaction.oncomplete = () => {
+      db.close()
+      resolve()
+    }
+
+    transaction.onerror = () => {
+      db.close()
+      reject(transaction.error || new Error('Failed to write RAG chunks to IndexedDB'))
+    }
+  })
+}
+
+async function readAllRagChunksFromIndexedDb() {
+  const db = await openLibraryDb()
+  if (!db) {
+    return []
+  }
+
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(RAG_CHUNKS_STORE_NAME, 'readonly')
+    const store = transaction.objectStore(RAG_CHUNKS_STORE_NAME)
+    const request = store.getAll()
+
+    request.onsuccess = () => {
+      resolve(Array.isArray(request.result) ? request.result : [])
+    }
+
+    request.onerror = () => {
+      reject(request.error || new Error('Failed to read RAG chunks from IndexedDB'))
+    }
+
+    transaction.oncomplete = () => {
+      db.close()
+    }
+  })
+}
+
+async function readAllRagEmbeddingsFromIndexedDb() {
+  const db = await openLibraryDb()
+  if (!db) {
+    return []
+  }
+
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(RAG_EMBEDDINGS_STORE_NAME, 'readonly')
+    const store = transaction.objectStore(RAG_EMBEDDINGS_STORE_NAME)
+    const request = store.getAll()
+
+    request.onsuccess = () => {
+      resolve(Array.isArray(request.result) ? request.result : [])
+    }
+
+    request.onerror = () => {
+      reject(request.error || new Error('Failed to read RAG embeddings from IndexedDB'))
+    }
+
+    transaction.oncomplete = () => {
+      db.close()
+    }
+  })
+}
+
+async function writeRagEmbeddingsToIndexedDb(embeddings, meta = {}) {
+  const db = await openLibraryDb()
+  if (!db) {
+    return
+  }
+
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([RAG_EMBEDDINGS_STORE_NAME, RAG_META_STORE_NAME], 'readwrite')
+    const embeddingStore = transaction.objectStore(RAG_EMBEDDINGS_STORE_NAME)
+    const metaStore = transaction.objectStore(RAG_META_STORE_NAME)
+
+    for (const record of embeddings) {
+      embeddingStore.put(record)
+    }
+
+    metaStore.put({
+      key: RAG_EMBED_META_KEY,
+      updatedAt: new Date().toISOString(),
+      ...meta,
+    })
+
+    transaction.oncomplete = () => {
+      db.close()
+      resolve()
+    }
+
+    transaction.onerror = () => {
+      db.close()
+      reject(transaction.error || new Error('Failed to write RAG embeddings to IndexedDB'))
+    }
+  })
+}
+
+function getEmbeddingModelName() {
+  if (GEMINI_EMBEDDING_API_KEY && Date.now() >= geminiRateLimitedUntilMs) {
+    return GEMINI_EMBEDDING_MODEL
+  }
+
+  return LOCAL_EMBEDDING_MODEL
+}
+
+function getRagStatusTone(status) {
+  const value = String(status || '').toLowerCase()
+  if (value.includes('failed') || value.includes('error')) {
+    return 'bad'
+  }
+
+  if (value.includes('ready') || value.includes('answered')) {
+    return 'good'
+  }
+
+  return 'warn'
+}
+
+function getGeminiRateLimitCooldownMs(response) {
+  const retryAfter = response.headers.get('retry-after')
+  const parsedRetryAfter = Number(retryAfter)
+  if (Number.isFinite(parsedRetryAfter) && parsedRetryAfter > 0) {
+    return parsedRetryAfter * 1000
+  }
+
+  return GEMINI_RATE_LIMIT_COOLDOWN_MS
+}
+
+function normalizeVector(values) {
+  let sumSquares = 0
+  for (const value of values) {
+    const number = Number(value || 0)
+    sumSquares += number * number
+  }
+
+  const magnitude = Math.sqrt(sumSquares) || 1
+  return values.map((value) => Number((Number(value || 0) / magnitude).toFixed(8)))
+}
+
+async function getMiniLmEmbedder() {
+  if (!miniLmEmbedderPromise) {
+    miniLmEmbedderPromise = import('@huggingface/transformers').then(async ({ env, pipeline }) => {
+      env.allowLocalModels = false
+      env.allowRemoteModels = true
+      env.useBrowserCache = true
+
+      return pipeline('feature-extraction', LOCAL_EMBEDDING_MODEL_ID, { quantized: true })
+    })
+  }
+
+  return miniLmEmbedderPromise
+}
+
+async function embedTextWithLocalMiniLm(text) {
+  const embedder = await getMiniLmEmbedder()
+  const output = await embedder(String(text || ''), {
+    pooling: 'mean',
+    normalize: true,
+  })
+
+  if (output?.data && output.data.length) {
+    return Array.from(output.data, (value) => Number(value))
+  }
+
+  if (typeof output?.tolist === 'function') {
+    const list = output.tolist()
+    if (Array.isArray(list) && list.length) {
+      const first = Array.isArray(list[0]) ? list[0] : list
+      if (Array.isArray(first) && first.length) {
+        return normalizeVector(first)
+      }
+    }
+  }
+
+  throw new Error('Local MiniLM embedding output was empty')
+}
+
+async function embedTextWithGemini(text) {
+  if (!GEMINI_EMBEDDING_API_KEY) {
+    return null
+  }
+
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_EMBEDDING_MODEL)}:embedContent?key=${encodeURIComponent(GEMINI_EMBEDDING_API_KEY)}`
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      content: {
+        parts: [{ text: String(text || '') }],
+      },
+      taskType: 'RETRIEVAL_DOCUMENT',
+    }),
+  })
+
+  if (response.status === 429) {
+    const cooldownMs = getGeminiRateLimitCooldownMs(response)
+    geminiRateLimitedUntilMs = Date.now() + cooldownMs
+    throw new Error(`Gemini rate limited for ${Math.ceil(cooldownMs / 1000)} seconds`) 
+  }
+
+  if (!response.ok) {
+    throw new Error(`Gemini embedding request failed: ${response.status}`)
+  }
+
+  const payload = await response.json()
+  const values = payload?.embedding?.values
+
+  if (!Array.isArray(values) || !values.length) {
+    throw new Error('Gemini embedding response was empty')
+  }
+
+  return values.map((value) => Number(value))
+}
+
+async function createEmbeddingVector(text) {
+  const canUseGemini = GEMINI_EMBEDDING_API_KEY && Date.now() >= geminiRateLimitedUntilMs
+  if (canUseGemini) {
+    try {
+      const geminiEmbedding = await embedTextWithGemini(text)
+      if (geminiEmbedding && geminiEmbedding.length) {
+        return geminiEmbedding
+      }
+    } catch {
+      // Fall back to local MiniLM embedding if Gemini fails or is rate-limited.
+    }
+  }
+
+  return embedTextWithLocalMiniLm(text)
+}
+
+async function syncRagEmbeddingsFromChunks(chunks, onProgress) {
+  const model = getEmbeddingModelName()
+  const allExisting = await readAllRagEmbeddingsFromIndexedDb()
+
+  const existingByModelHash = new Map()
+  for (const record of allExisting) {
+    if (record?.model === model && record?.modelHash) {
+      existingByModelHash.set(record.modelHash, record)
+    }
+  }
+
+  const missing = []
+  for (const chunk of chunks) {
+    const modelHash = `${model}:${chunk.hash}`
+    if (!existingByModelHash.has(modelHash)) {
+      missing.push(chunk)
+    }
+  }
+
+  if (!missing.length) {
+    await writeRagEmbeddingsToIndexedDb([], {
+      model,
+      embeddedChunkCount: chunks.length,
+      pendingChunkCount: 0,
+    })
+
+    if (onProgress) {
+      onProgress({ processed: chunks.length, total: chunks.length, created: 0, reused: chunks.length, model })
+    }
+
+    return {
+      created: 0,
+      reused: chunks.length,
+      total: chunks.length,
+      model,
+    }
+  }
+
+  const recordsToFlush = []
+  let created = 0
+  const reused = chunks.length - missing.length
+
+  for (let index = 0; index < missing.length; index += 1) {
+    const chunk = missing[index]
+    const embedding = await createEmbeddingVector(chunk.content)
+    const modelHash = `${model}:${chunk.hash}`
+
+    recordsToFlush.push({
+      chunkId: chunk.chunkId,
+      docId: chunk.docId,
+      hash: chunk.hash,
+      model,
+      modelHash,
+      embedding,
+      dimensions: embedding.length,
+      updatedAt: new Date().toISOString(),
+    })
+    created += 1
+
+    if (recordsToFlush.length >= EMBEDDING_FLUSH_BATCH_SIZE) {
+      const batch = recordsToFlush.splice(0, recordsToFlush.length)
+      await writeRagEmbeddingsToIndexedDb(batch, {
+        model,
+        embeddedChunkCount: reused + created,
+        pendingChunkCount: missing.length - (index + 1),
+      })
+    }
+
+    if (onProgress) {
+      onProgress({
+        processed: reused + created,
+        total: chunks.length,
+        created,
+        reused,
+        model,
+      })
+    }
+  }
+
+  if (recordsToFlush.length) {
+    await writeRagEmbeddingsToIndexedDb(recordsToFlush, {
+      model,
+      embeddedChunkCount: chunks.length,
+      pendingChunkCount: 0,
+    })
+  }
+
+  return {
+    created,
+    reused,
+    total: chunks.length,
+    model,
+  }
+}
+
+function cosineSimilarity(vectorA, vectorB) {
+  if (!Array.isArray(vectorA) || !Array.isArray(vectorB) || !vectorA.length || vectorA.length !== vectorB.length) {
+    return -1
+  }
+
+  let dot = 0
+  let normA = 0
+  let normB = 0
+
+  for (let index = 0; index < vectorA.length; index += 1) {
+    const a = Number(vectorA[index] || 0)
+    const b = Number(vectorB[index] || 0)
+    dot += a * b
+    normA += a * a
+    normB += b * b
+  }
+
+  const denominator = Math.sqrt(normA) * Math.sqrt(normB)
+  if (!denominator) {
+    return -1
+  }
+
+  return dot / denominator
+}
+
+async function retrieveRagTopChunks({ query, topK = 5, scopeSection = '', minScore = 0.08 }) {
+  const trimmedQuery = String(query || '').trim()
+  if (!trimmedQuery) {
+    return { model: getEmbeddingModelName(), totalCandidates: 0, results: [] }
+  }
+
+  const model = getEmbeddingModelName()
+  const [chunks, embeddings] = await Promise.all([readAllRagChunksFromIndexedDb(), readAllRagEmbeddingsFromIndexedDb()])
+  if (!chunks.length || !embeddings.length) {
+    return { model, totalCandidates: 0, results: [] }
+  }
+
+  const queryEmbedding = await createEmbeddingVector(trimmedQuery)
+  const requiredDimensions = queryEmbedding.length
+
+  const chunkById = new Map(chunks.map((chunk) => [chunk.chunkId, chunk]))
+  const normalizedScopeSection = String(scopeSection || '').trim().toLowerCase()
+
+  const scored = []
+  for (const embedding of embeddings) {
+    if (embedding?.model !== model) {
+      continue
+    }
+
+    if (!Array.isArray(embedding?.embedding) || embedding.embedding.length !== requiredDimensions) {
+      continue
+    }
+
+    const chunk = chunkById.get(embedding.chunkId)
+    if (!chunk) {
+      continue
+    }
+
+    if (normalizedScopeSection && String(chunk.section || '').toLowerCase() !== normalizedScopeSection) {
+      continue
+    }
+
+    const score = cosineSimilarity(queryEmbedding, embedding.embedding)
+    if (!Number.isFinite(score) || score < minScore) {
+      continue
+    }
+
+    scored.push({
+      chunkId: chunk.chunkId,
+      docId: chunk.docId,
+      title: chunk.title,
+      section: chunk.section,
+      source: chunk.source,
+      sourceRepo: chunk.sourceRepo,
+      content: chunk.content,
+      score,
+    })
+  }
+
+  scored.sort((a, b) => b.score - a.score)
+
+  return {
+    model,
+    totalCandidates: scored.length,
+    results: scored.slice(0, Math.max(1, topK)),
+  }
+}
+
+function buildContextFromChunks(chunks, maxChunks = 6) {
+  return chunks.slice(0, maxChunks).map((chunk, index) => {
+    return [
+      `[Chunk ${index + 1}]`,
+      `Title: ${chunk.title}`,
+      `Section: ${chunk.section}`,
+      `Source: ${chunk.sourceRepo}`,
+      `Content: ${chunk.content}`,
+    ].join('\n')
+  }).join('\n\n')
+}
+
+function buildLocalGroundedFallbackAnswer(question, chunks) {
+  const top = chunks.slice(0, 3)
+  const bullets = top.map((chunk) => `- ${chunk.title} (${chunk.section}): ${chunk.content.slice(0, 220)}${chunk.content.length > 220 ? '...' : ''}`)
+
+  return [
+    `I could not call Groq right now, so this is a grounded local summary for: "${question}".`,
+    '',
+    'Relevant excerpts:',
+    ...bullets,
+    '',
+    'Tip: set VITE_GROQ_API_KEY to enable full AI answers.',
+  ].join('\n')
+}
+
+async function askGroqWithContext({ question, chunks }) {
+  if (!GROQ_API_KEY) {
+    return buildLocalGroundedFallbackAnswer(question, chunks)
+  }
+
+  const context = buildContextFromChunks(chunks, 6)
+  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${GROQ_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: GROQ_CHAT_MODEL,
+      temperature: 0.2,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You are a documentation assistant. Answer only using the provided context. If context is insufficient, say so clearly. Keep answers concise and include actionable points.',
+        },
+        {
+          role: 'user',
+          content: `Context:\n${context}\n\nQuestion:\n${question}`,
+        },
+      ],
+    }),
+  })
+
+  if (!response.ok) {
+    const text = await response.text()
+    throw new Error(`Groq request failed: ${response.status} ${text}`)
+  }
+
+  const data = await response.json()
+  return String(data?.choices?.[0]?.message?.content || '').trim()
+}
+
+async function clearRagChunksFromIndexedDb() {
+  const db = await openLibraryDb()
+  if (!db) {
+    return
+  }
+
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([RAG_CHUNKS_STORE_NAME, RAG_META_STORE_NAME], 'readwrite')
+    const chunkStore = transaction.objectStore(RAG_CHUNKS_STORE_NAME)
+    const metaStore = transaction.objectStore(RAG_META_STORE_NAME)
+
+    chunkStore.clear()
+    metaStore.delete(RAG_META_KEY)
+
+    transaction.oncomplete = () => {
+      db.close()
+      resolve()
+    }
+
+    transaction.onerror = () => {
+      db.close()
+      reject(transaction.error || new Error('Failed to clear RAG chunks from IndexedDB'))
+    }
+  })
+}
+
+async function clearRagEmbeddingsFromIndexedDb() {
+  const db = await openLibraryDb()
+  if (!db) {
+    return
+  }
+
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([RAG_EMBEDDINGS_STORE_NAME, RAG_META_STORE_NAME], 'readwrite')
+    const embeddingStore = transaction.objectStore(RAG_EMBEDDINGS_STORE_NAME)
+    const metaStore = transaction.objectStore(RAG_META_STORE_NAME)
+
+    embeddingStore.clear()
+    metaStore.delete(RAG_EMBED_META_KEY)
+
+    transaction.oncomplete = () => {
+      db.close()
+      resolve()
+    }
+
+    transaction.onerror = () => {
+      db.close()
+      reject(transaction.error || new Error('Failed to clear RAG embeddings from IndexedDB'))
+    }
+  })
+}
+
 function formatDateTime(value) {
   if (!value) {
     return 'Never'
@@ -168,7 +778,7 @@ function normalizeView(value) {
     return 'git'
   }
 
-  if (value === 'dashboard' || value === 'git' || value === 'settings' || value === 'profile') {
+  if (value === 'dashboard' || value === 'git' || value === 'chat' || value === 'settings' || value === 'profile') {
     return value
   }
 
@@ -252,6 +862,27 @@ function isPdfDoc(doc) {
 
   const sourcePath = String(doc.source || '')
   return PDF_DOC_PATTERN.test(sourcePath)
+}
+
+function isMarkdownLikeDoc(doc) {
+  if (!doc) {
+    return false
+  }
+
+  const format = String(doc.format || '').toLowerCase()
+  if (format === 'pdf') {
+    return false
+  }
+
+  if (format === 'markdown') {
+    return true
+  }
+
+  if (!String(doc.content || '').trim()) {
+    return false
+  }
+
+  return !PDF_DOC_PATTERN.test(String(doc.source || ''))
 }
 
 function getPathVariants(path) {
@@ -508,6 +1139,43 @@ function decodeBase64ToBytes(base64Content) {
   return Uint8Array.from(atob(String(base64Content || '')), (char) => char.charCodeAt(0))
 }
 
+async function renderPdfPagesToDataUrls(pdfBytes, targetWidth) {
+  const pdfJs = await loadPdfJs()
+  const loadingTask = pdfJs.getDocument({ data: pdfBytes })
+  const pdf = await loadingTask.promise
+  const pages = []
+  const outputScale = Math.min(2.2, Math.max(1, window.devicePixelRatio || 1))
+
+  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+    const page = await pdf.getPage(pageNumber)
+    const baseViewport = page.getViewport({ scale: 1 })
+    const fitScale = Math.max(1, targetWidth / Math.max(1, baseViewport.width))
+    const viewport = page.getViewport({ scale: fitScale })
+
+    const canvas = document.createElement('canvas')
+    const context = canvas.getContext('2d', { alpha: false })
+    if (!context) {
+      throw new Error('Could not create canvas context for PDF page rendering.')
+    }
+
+    canvas.width = Math.ceil(viewport.width * outputScale)
+    canvas.height = Math.ceil(viewport.height * outputScale)
+    canvas.style.width = `${Math.ceil(viewport.width)}px`
+    canvas.style.height = `${Math.ceil(viewport.height)}px`
+    context.imageSmoothingEnabled = true
+    context.imageSmoothingQuality = 'high'
+
+    await page.render({
+      canvasContext: context,
+      viewport,
+      transform: outputScale === 1 ? undefined : [outputScale, 0, 0, outputScale, 0, 0],
+    }).promise
+    pages.push(canvas.toDataURL('image/png'))
+  }
+
+  return pages
+}
+
 async function fetchGitHubBinaryFromDownloadUrl(downloadUrl, token) {
   if (!downloadUrl) {
     return null
@@ -715,7 +1383,7 @@ async function fetchMarkdownDocsFromRepo({ owner, repo, token }) {
         const pdfBase64 = encodeBytesToBase64(pdfBytes)
 
         return {
-          id: `${toSlug(entry.path)}-${crypto.randomUUID()}`,
+          id: `${toSlug(entry.path)}-${createClientId()}`,
           title: getTitleFromPath(entry.path),
           section: getSectionFromPath(entry.path),
           sourceRepo: `${owner}/${repo}`,
@@ -735,7 +1403,7 @@ async function fetchMarkdownDocsFromRepo({ owner, repo, token }) {
       }
 
       return {
-        id: `${toSlug(entry.path)}-${crypto.randomUUID()}`,
+        id: `${toSlug(entry.path)}-${createClientId()}`,
         title: getTitleFromPath(entry.path),
         section: getSectionFromPath(entry.path),
         sourceRepo: `${owner}/${repo}`,
@@ -827,8 +1495,13 @@ function getDesktopTourSteps() {
     },
     {
       target: '.sidebar-nav-list .nav-link:nth-child(4)',
-      content: 'Profile: manage account session, cloud backup, restore, and replay tour.',
+      content: 'AI Assistant: ask questions and retrieve grounded context from your docs.',
       placement: 'right',
+    },
+    {
+      target: '.topbar-profile-button',
+      content: 'Profile: manage account session, cloud backup, restore, and replay tour.',
+      placement: 'bottom',
     },
     {
       target: '.sidebar-search-input',
@@ -868,8 +1541,13 @@ function getMobileTourSteps() {
     },
     {
       target: '.mobile-bottom-nav .mobile-bottom-link:nth-child(4)',
-      content: 'Profile: account, cloud backup, and restore controls.',
+      content: 'AI Assistant: ask questions grounded in your synced and local docs.',
       placement: 'top',
+    },
+    {
+      target: '.topbar-profile-button',
+      content: 'Profile: account, cloud backup, and restore controls.',
+      placement: 'left',
     },
     {
       target: '.mobile-menu-button',
@@ -892,6 +1570,7 @@ function App() {
   const [expandedSectionIds, setExpandedSectionIds] = useState(() => new Set())
   const [selectedDocId, setSelectedDocId] = useState('')
   const [dashboardSearchQuery, setDashboardSearchQuery] = useState('')
+  const [deferredDashboardSearchQuery, setDeferredDashboardSearchQuery] = useState('')
   const [isSectionsPanelOpen, setIsSectionsPanelOpen] = useState(false)
   const [hasHydratedLibrary, setHasHydratedLibrary] = useState(false)
   const [error, setError] = useState('')
@@ -938,6 +1617,20 @@ function App() {
   const [isMobileViewport, setIsMobileViewport] = useState(() => window.matchMedia('(max-width: 1024px)').matches)
   const [readingProgress, setReadingProgress] = useState(0)
   const [progressDocId, setProgressDocId] = useState('')
+  const [ragIndexStatus, setRagIndexStatus] = useState('Idle')
+  const [ragEmbeddingStatus, setRagEmbeddingStatus] = useState('Idle')
+  const [chatScope, setChatScope] = useState('section')
+  const [chatInput, setChatInput] = useState('')
+  const [isChatResponding, setIsChatResponding] = useState(false)
+  const [chatStatus, setChatStatus] = useState('Ask a question to start chatting with your docs.')
+  const [chatMessages, setChatMessages] = useState([
+    {
+      id: createClientId(),
+      role: 'assistant',
+      content: 'I am ready. Ask me about your synced docs and I will answer using retrieved context.',
+      citations: [],
+    },
+  ])
   const [readDocSources, setReadDocSources] = useState(() => {
     try {
       const cached = localStorage.getItem(READ_DOC_SOURCES_STORAGE_KEY)
@@ -959,9 +1652,18 @@ function App() {
   const hasAttemptedLoginRestoreRef = useRef(false)
   const hasStartedTourRef = useRef(false)
   const tourStartTimeoutRef = useRef(null)
+  const libraryPersistTimeoutRef = useRef(null)
+  const searchDebounceTimeoutRef = useRef(null)
+  const readingProgressRafRef = useRef(null)
+  const ragIndexerWorkerRef = useRef(null)
+  const ragIndexTimeoutRef = useRef(null)
+  const ragIndexRequestIdRef = useRef('')
   const documentPanelRef = useRef(null)
+  const chatHistoryRef = useRef(null)
 
   const isMobileSyncBarVisible = activeView === 'git' && gitSyncMode === 'repos' && Boolean(githubUser)
+  const ragIndexTone = getRagStatusTone(ragIndexStatus)
+  const ragEmbeddingTone = getRagStatusTone(ragEmbeddingStatus)
 
   const updateSyncMeta = (summary) => {
     setSyncMeta({
@@ -991,6 +1693,96 @@ function App() {
       if (tourStartTimeoutRef.current) {
         window.clearTimeout(tourStartTimeoutRef.current)
       }
+
+      if (libraryPersistTimeoutRef.current) {
+        window.clearTimeout(libraryPersistTimeoutRef.current)
+      }
+
+      if (searchDebounceTimeoutRef.current) {
+        window.clearTimeout(searchDebounceTimeoutRef.current)
+      }
+
+      if (readingProgressRafRef.current !== null) {
+        window.cancelAnimationFrame(readingProgressRafRef.current)
+      }
+
+      if (ragIndexTimeoutRef.current) {
+        window.clearTimeout(ragIndexTimeoutRef.current)
+      }
+
+      if (ragIndexerWorkerRef.current) {
+        ragIndexerWorkerRef.current.terminate()
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    const worker = new Worker(new URL('./workers/ragIndexer.worker.js', import.meta.url), { type: 'module' })
+    ragIndexerWorkerRef.current = worker
+
+    const handleMessage = (event) => {
+      const payload = event?.data || {}
+      const requestId = String(payload.requestId || '')
+      if (!requestId || requestId !== ragIndexRequestIdRef.current) {
+        return
+      }
+
+      if (payload.type === 'index-progress') {
+        const processedDocs = Number(payload.processedDocs || 0)
+        const totalDocs = Number(payload.totalDocs || 0)
+        setRagIndexStatus(`Indexing ${processedDocs}/${totalDocs} docs...`)
+        return
+      }
+
+      if (payload.type === 'index-complete') {
+        const chunks = Array.isArray(payload.chunks) ? payload.chunks : []
+        const meta = payload.meta && typeof payload.meta === 'object' ? payload.meta : {}
+        setRagIndexStatus(`Saving ${chunks.length} chunks...`)
+        setRagEmbeddingStatus('Waiting for chunk persistence...')
+
+        writeRagChunksToIndexedDb(chunks, meta)
+          .then(async () => {
+            setRagIndexStatus(`Ready (${chunks.length} chunks indexed)`)
+            if (!chunks.length) {
+              setRagEmbeddingStatus('Idle (no chunks to embed)')
+              clearRagEmbeddingsFromIndexedDb().catch(() => {
+                // Best-effort cleanup.
+              })
+              return
+            }
+
+            try {
+              setRagEmbeddingStatus('Preparing embeddings...')
+              const result = await syncRagEmbeddingsFromChunks(chunks, ({ processed, total, model }) => {
+                setRagEmbeddingStatus(`Embedding ${processed}/${total} chunks (${model})...`)
+              })
+
+              setRagEmbeddingStatus(`Ready (${result.total} chunks, ${result.created} new, model: ${result.model})`)
+            } catch {
+              setRagEmbeddingStatus('Embedding sync failed. Chunks are indexed and embeddings will retry on next update.')
+            }
+          })
+          .catch(() => {
+            setRagIndexStatus('RAG index save failed. Your docs are safe; retry on next sync/update.')
+            setRagEmbeddingStatus('Idle (waiting for successful indexing)')
+          })
+        return
+      }
+
+      if (payload.type === 'index-error') {
+        setRagIndexStatus('RAG indexing failed. It will retry on the next update.')
+        setRagEmbeddingStatus('Idle (index not ready)')
+      }
+    }
+
+    worker.addEventListener('message', handleMessage)
+
+    return () => {
+      worker.removeEventListener('message', handleMessage)
+      worker.terminate()
+      if (ragIndexerWorkerRef.current === worker) {
+        ragIndexerWorkerRef.current = null
+      }
     }
   }, [])
 
@@ -1006,6 +1798,7 @@ function App() {
 
         if (Array.isArray(indexedDbLibrary)) {
           setLibrary(indexedDbLibrary)
+          localStorage.removeItem(STORAGE_KEY)
           setHasHydratedLibrary(true)
           return
         }
@@ -1023,9 +1816,14 @@ function App() {
         const parsed = JSON.parse(cached)
         if (Array.isArray(parsed)) {
           setLibrary(parsed)
-          writeLibraryToIndexedDb(parsed).catch(() => {
-            // Best-effort migration from localStorage to IndexedDB.
-          })
+          writeLibraryToIndexedDb(parsed)
+            .then(() => {
+              // Keep localStorage only as a legacy import source and clear it after migration.
+              localStorage.removeItem(STORAGE_KEY)
+            })
+            .catch(() => {
+              // Best-effort migration from localStorage to IndexedDB.
+            })
         }
         setHasHydratedLibrary(true)
       } catch {
@@ -1046,18 +1844,100 @@ function App() {
       return
     }
 
-    const persistLibrary = async () => {
-      try {
-        await writeLibraryToIndexedDb(library)
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(library))
-        setStorageWarning('')
-      } catch {
-        setStorageWarning('Storage is full. Export your library or clear unused docs to avoid data loss.')
-      }
+    if (libraryPersistTimeoutRef.current) {
+      window.clearTimeout(libraryPersistTimeoutRef.current)
     }
 
-    persistLibrary()
+    // Debounce large IndexedDB writes to avoid blocking during rapid state updates.
+    libraryPersistTimeoutRef.current = window.setTimeout(() => {
+      writeLibraryToIndexedDb(library)
+        .then(() => {
+          setStorageWarning('')
+        })
+        .catch(() => {
+          setStorageWarning('Storage is full. Export your library or clear unused docs to avoid data loss.')
+        })
+    }, 350)
+
+    return () => {
+      if (libraryPersistTimeoutRef.current) {
+        window.clearTimeout(libraryPersistTimeoutRef.current)
+      }
+    }
   }, [library, hasHydratedLibrary])
+
+  useEffect(() => {
+    if (!hasHydratedLibrary) {
+      return
+    }
+
+    if (!ragIndexerWorkerRef.current) {
+      return
+    }
+
+    if (ragIndexTimeoutRef.current) {
+      window.clearTimeout(ragIndexTimeoutRef.current)
+    }
+
+    const markdownDocs = library
+      .flatMap((section) => section.docs || [])
+      .filter((doc) => isMarkdownLikeDoc(doc))
+      .map((doc) => ({
+        id: doc.id,
+        title: doc.title,
+        section: doc.section,
+        source: doc.source,
+        sourceRepo: doc.sourceRepo,
+        format: doc.format,
+        content: doc.content,
+      }))
+
+    if (!markdownDocs.length) {
+      setRagIndexStatus('Idle (no markdown docs to index)')
+      setRagEmbeddingStatus('Idle (no markdown docs)')
+      clearRagChunksFromIndexedDb().catch(() => {
+        // Best-effort cleanup.
+      })
+      clearRagEmbeddingsFromIndexedDb().catch(() => {
+        // Best-effort cleanup.
+      })
+      return
+    }
+
+    ragIndexTimeoutRef.current = window.setTimeout(() => {
+      const requestId = createClientId()
+      ragIndexRequestIdRef.current = requestId
+      setRagIndexStatus('Preparing RAG index...')
+      ragIndexerWorkerRef.current?.postMessage({
+        type: 'index-library',
+        requestId,
+        docs: markdownDocs,
+      })
+    }, 600)
+
+    return () => {
+      if (ragIndexTimeoutRef.current) {
+        window.clearTimeout(ragIndexTimeoutRef.current)
+      }
+    }
+  }, [library, hasHydratedLibrary])
+
+  useEffect(() => {
+    if (searchDebounceTimeoutRef.current) {
+      window.clearTimeout(searchDebounceTimeoutRef.current)
+    }
+
+    // Debounce query updates so large-content filtering doesn't run on every keystroke.
+    searchDebounceTimeoutRef.current = window.setTimeout(() => {
+      setDeferredDashboardSearchQuery(dashboardSearchQuery)
+    }, 180)
+
+    return () => {
+      if (searchDebounceTimeoutRef.current) {
+        window.clearTimeout(searchDebounceTimeoutRef.current)
+      }
+    }
+  }, [dashboardSearchQuery])
 
   useEffect(() => {
     localStorage.setItem(SYNC_META_STORAGE_KEY, JSON.stringify(syncMeta))
@@ -1205,6 +2085,19 @@ function App() {
     startOnboardingTour()
   }, [githubUser, isAuthLoading, isMobileViewport])
 
+  useEffect(() => {
+    if (activeView !== 'chat') {
+      return
+    }
+
+    const historyElement = chatHistoryRef.current
+    if (!historyElement) {
+      return
+    }
+
+    historyElement.scrollTop = historyElement.scrollHeight
+  }, [activeView, chatMessages, isChatResponding])
+
   const onTourCallback = (data) => {
     const status = String(data?.status || '')
     const action = String(data?.action || '')
@@ -1220,7 +2113,7 @@ function App() {
   }, [library])
 
   const filteredLibrary = useMemo(() => {
-    const query = dashboardSearchQuery.trim().toLowerCase()
+    const query = deferredDashboardSearchQuery.trim().toLowerCase()
     if (!query) {
       return library
     }
@@ -1238,7 +2131,7 @@ function App() {
         }
       })
       .filter((section) => section.docs.length > 0)
-  }, [library, dashboardSearchQuery])
+  }, [library, deferredDashboardSearchQuery])
 
   const filteredDocsCount = useMemo(() => {
     return filteredLibrary.reduce((total, section) => total + section.docs.length, 0)
@@ -1279,22 +2172,50 @@ function App() {
     return allDocs.find((doc) => doc.id === selectedDocId) || null
   }, [allDocs, selectedDocId])
 
-  const [selectedPdfUrl, setSelectedPdfUrl] = useState('')
+  const [selectedPdfPages, setSelectedPdfPages] = useState([])
+  const [isPdfPageRendering, setIsPdfPageRendering] = useState(false)
+  const [pdfRenderError, setPdfRenderError] = useState('')
 
   useEffect(() => {
     if (!selectedDoc || !isPdfDoc(selectedDoc) || !selectedDoc.pdfBase64) {
-      setSelectedPdfUrl('')
+      setSelectedPdfPages([])
+      setIsPdfPageRendering(false)
+      setPdfRenderError('')
       return
     }
 
-    const pdfBytes = decodeBase64ToBytes(selectedDoc.pdfBase64)
-    const blob = new Blob([pdfBytes], { type: selectedDoc.mimeType || 'application/pdf' })
-    const objectUrl = URL.createObjectURL(blob)
-    setSelectedPdfUrl(objectUrl)
+    let cancelled = false
+
+    const renderPdfPages = async () => {
+      setPdfRenderError('')
+      setIsPdfPageRendering(true)
+
+      try {
+        const pdfBytes = decodeBase64ToBytes(selectedDoc.pdfBase64)
+        const panelWidth = documentPanelRef.current?.clientWidth || window.innerWidth
+        const contentWidth = Math.max(320, Math.min(1400, panelWidth - 72))
+        const pageImages = await renderPdfPagesToDataUrls(pdfBytes, contentWidth)
+
+        if (!cancelled) {
+          setSelectedPdfPages(pageImages)
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setSelectedPdfPages([])
+          const message = err instanceof Error ? err.message : 'Could not render PDF on this device.'
+          setPdfRenderError(message)
+        }
+      } finally {
+        if (!cancelled) {
+          setIsPdfPageRendering(false)
+        }
+      }
+    }
+
+    renderPdfPages()
 
     return () => {
-      URL.revokeObjectURL(objectUrl)
-      setSelectedPdfUrl('')
+      cancelled = true
     }
   }, [selectedDoc])
 
@@ -1320,6 +2241,10 @@ function App() {
     }
 
     const resetProgress = () => {
+      if (readingProgressRafRef.current !== null) {
+        window.cancelAnimationFrame(readingProgressRafRef.current)
+        readingProgressRafRef.current = null
+      }
       setReadingProgress(0)
       setProgressDocId('')
     }
@@ -1329,13 +2254,7 @@ function App() {
       return
     }
 
-    if (isPdfDoc(selectedDoc)) {
-      setProgressDocId(selectedDoc.id)
-      setReadingProgress(100)
-      return
-    }
-
-    const updateProgress = () => {
+    const applyProgress = () => {
       setProgressDocId(selectedDoc.id)
       const totalScrollable = panel.scrollHeight - panel.clientHeight
       if (totalScrollable <= 0) {
@@ -1347,12 +2266,27 @@ function App() {
       setReadingProgress(nextProgress)
     }
 
+    const updateProgress = () => {
+      if (readingProgressRafRef.current !== null) {
+        return
+      }
+
+      readingProgressRafRef.current = window.requestAnimationFrame(() => {
+        readingProgressRafRef.current = null
+        applyProgress()
+      })
+    }
+
     panel.scrollTop = 0
     updateProgress()
     panel.addEventListener('scroll', updateProgress, { passive: true })
 
     return () => {
       panel.removeEventListener('scroll', updateProgress)
+      if (readingProgressRafRef.current !== null) {
+        window.cancelAnimationFrame(readingProgressRafRef.current)
+        readingProgressRafRef.current = null
+      }
     }
   }, [activeView, selectedDocId, selectedDoc])
 
@@ -1546,7 +2480,7 @@ function App() {
 
           if (PDF_DOC_PATTERN.test(file.name)) {
             return {
-              id: `${toSlug(file.name)}-${crypto.randomUUID()}`,
+              id: `${toSlug(file.name)}-${createClientId()}`,
               title: getTitleFromFile(file),
               section: getSectionFromFile(file),
               sourceRepo: 'Local Uploads',
@@ -1560,7 +2494,7 @@ function App() {
           }
 
           return {
-            id: `${toSlug(file.name)}-${crypto.randomUUID()}`,
+            id: `${toSlug(file.name)}-${createClientId()}`,
             title: getTitleFromFile(file),
             section: getSectionFromFile(file),
             sourceRepo: 'Local Uploads',
@@ -1661,7 +2595,6 @@ function App() {
 
     const librarySnapshot = library
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(librarySnapshot))
       writeLibraryToIndexedDb(librarySnapshot).catch(() => {
         // Best-effort persistence while signing out.
       })
@@ -1851,6 +2784,149 @@ function App() {
     deleteLibraryFromIndexedDb().catch(() => {
       // Ignore clear failures; local state is already reset.
     })
+    clearRagChunksFromIndexedDb().catch(() => {
+      // Ignore clear failures; local state is already reset.
+    })
+    clearRagEmbeddingsFromIndexedDb().catch(() => {
+      // Ignore clear failures; local state is already reset.
+    })
+    setRagIndexStatus('Idle')
+    setRagEmbeddingStatus('Idle')
+  }
+
+  const runChatWithRag = async () => {
+    const question = String(chatInput || '').trim()
+    if (!question) {
+      setChatStatus('Enter a question first.')
+      return
+    }
+
+    const scopeSection = chatScope === 'section' ? String(selectedDoc?.section || '') : ''
+    if (chatScope === 'section' && !scopeSection) {
+      setChatStatus('Open a document first for section scope, or switch to Library scope.')
+      return
+    }
+
+    const userMessage = {
+      id: createClientId(),
+      role: 'user',
+      content: question,
+      citations: [],
+    }
+
+    setChatMessages((previous) => [...previous, userMessage])
+    setChatInput('')
+    setIsChatResponding(true)
+    setChatStatus('Checking RAG cache...')
+
+    try {
+      const chunks = await readAllRagChunksFromIndexedDb()
+      if (!chunks.length) {
+        setChatStatus('RAG index is still preparing. Please wait a few seconds and try again.')
+        setChatMessages((previous) => [
+          ...previous,
+          {
+            id: createClientId(),
+            role: 'assistant',
+            content: 'I do not see indexed chunks yet. This can happen right after restore while indexing is still running.',
+            citations: [],
+          },
+        ])
+        return
+      }
+
+      const scopedChunks = scopeSection
+        ? chunks.filter((chunk) => String(chunk.section || '').toLowerCase() === scopeSection.toLowerCase())
+        : chunks
+
+      const effectiveChunks = scopedChunks.length ? scopedChunks : chunks
+      const didFallbackToWholeLibrary = Boolean(scopeSection && !scopedChunks.length)
+
+      if (didFallbackToWholeLibrary) {
+        setChatStatus(`No chunks were found in section "${scopeSection}". Falling back to Library...`)
+      }
+
+      const activeModel = getEmbeddingModelName()
+      const embeddings = await readAllRagEmbeddingsFromIndexedDb()
+      const hasScopedEmbeddings = embeddings.some(
+        (record) => record?.model === activeModel && effectiveChunks.some((chunk) => chunk.chunkId === record.chunkId),
+      )
+
+      if (!hasScopedEmbeddings) {
+        setChatStatus(`Preparing embeddings for ${effectiveChunks.length} chunks...`)
+        const embedResult = await syncRagEmbeddingsFromChunks(effectiveChunks, ({ processed, total, model }) => {
+          setChatStatus(`Embedding ${processed}/${total} chunks (${model})...`)
+        })
+        setRagEmbeddingStatus(`Ready (${embedResult.total} chunks, ${embedResult.created} new, model: ${embedResult.model})`)
+      }
+
+      setChatStatus('Retrieving relevant context...')
+      const retrieval = await retrieveRagTopChunks({
+        query: question,
+        topK: 6,
+        scopeSection: didFallbackToWholeLibrary ? '' : scopeSection,
+      })
+
+      if (!retrieval.results.length) {
+        setChatStatus(`No relevant chunks found (model: ${retrieval.model}).`)
+        setChatMessages((previous) => [
+          ...previous,
+          {
+            id: createClientId(),
+            role: 'assistant',
+            content: 'I could not find relevant context for that question. Try rephrasing, switching scope, or syncing more docs.',
+            citations: [],
+          },
+        ])
+        return
+      }
+
+      setChatStatus('Generating grounded answer...')
+      const answer = await askGroqWithContext({ question, chunks: retrieval.results })
+      const citations = retrieval.results.map((item) => ({
+        chunkId: item.chunkId,
+        docId: item.docId,
+        title: item.title,
+        section: item.section,
+        score: item.score,
+      }))
+
+      setChatMessages((previous) => [
+        ...previous,
+        {
+          id: createClientId(),
+          role: 'assistant',
+          content: answer,
+          citations,
+        },
+      ])
+      setChatStatus(`Answered using ${retrieval.results.length} chunks (${retrieval.model}).`)
+    } catch {
+      setChatStatus('Chat generation failed. Please retry.')
+      setChatMessages((previous) => [
+        ...previous,
+        {
+          id: createClientId(),
+          role: 'assistant',
+          content: 'I hit an error while generating the answer. Please try again.',
+          citations: [],
+        },
+      ])
+    } finally {
+      setIsChatResponding(false)
+    }
+  }
+
+  const clearChatConversation = () => {
+    setChatMessages([
+      {
+        id: createClientId(),
+        role: 'assistant',
+        content: 'Conversation reset. Ask a new question and I will use your indexed docs as context.',
+        citations: [],
+      },
+    ])
+    setChatStatus('Chat cleared.')
   }
 
   const exportLibrary = () => {
@@ -1949,11 +3025,28 @@ function App() {
       githubAccessToken,
     )
 
-    if (!fileData?.content) {
-      throw new Error('Backup file content is empty.')
+    let encodedContent = fileData?.content || ''
+
+    if (!encodedContent && fileData?.sha) {
+      const blobData = await githubRequest(
+        `/repos/${githubLogin}/${BACKUP_REPO_NAME}/git/blobs/${fileData.sha}`,
+        githubAccessToken,
+      )
+      encodedContent = String(blobData?.content || '')
     }
 
-    return decodeGitHubContent(fileData.content)
+    if (encodedContent) {
+      return decodeGitHubContent(encodedContent)
+    }
+
+    if (fileData?.download_url) {
+      const backupBytes = await fetchGitHubBinaryFromDownloadUrl(fileData.download_url, githubAccessToken)
+      if (backupBytes) {
+        return new TextDecoder('utf-8').decode(backupBytes)
+      }
+    }
+
+    throw new Error('Backup file could not be downloaded from GitHub.')
   }
 
   const backupLibraryToGitHub = async ({ silent = false } = {}) => {
@@ -2230,31 +3323,33 @@ function App() {
 
   return (
     <div className={`app-shell ${isMobileSyncBarVisible ? 'mobile-sync-open' : ''}`}>
-      <Joyride
-        steps={tourSteps}
-        run={isTourRunning}
-        continuous
-        showSkipButton
-        showProgress
-        disableScrollParentFix
-        scrollToFirstStep
-        callback={onTourCallback}
-        styles={{
-          options: {
-            zIndex: 10000,
-            primaryColor: '#1e87a8',
-            textColor: '#1f2a3c',
-            width: isMobileViewport ? 300 : 380,
-          },
-        }}
-        locale={{
-          back: 'Back',
-          close: 'Close',
-          last: 'Done',
-          next: 'Next',
-          skip: 'Skip',
-        }}
-      />
+      <Suspense fallback={null}>
+        <Joyride
+          steps={tourSteps}
+          run={isTourRunning}
+          continuous
+          showSkipButton
+          showProgress
+          disableScrollParentFix
+          scrollToFirstStep
+          callback={onTourCallback}
+          styles={{
+            options: {
+              zIndex: 10000,
+              primaryColor: '#1e87a8',
+              textColor: '#1f2a3c',
+              width: isMobileViewport ? 300 : 380,
+            },
+          }}
+          locale={{
+            back: 'Back',
+            close: 'Close',
+            last: 'Done',
+            next: 'Next',
+            skip: 'Skip',
+          }}
+        />
+      </Suspense>
 
       <aside className={`sidebar ${isSectionsPanelOpen ? 'open' : ''}`}>
         <div className="sidebar-brand">Docs Hub</div>
@@ -2305,16 +3400,15 @@ function App() {
               </span>
             </button>
             <button
-              className={`nav-link ${activeView === 'profile' ? 'nav-link-active' : ''}`}
+              className={`nav-link ${activeView === 'chat' ? 'nav-link-active' : ''}`}
               type="button"
-              onClick={() => setActiveView('profile')}
+              onClick={() => setActiveView('chat')}
             >
               <span className="nav-link-inner">
                 <svg className="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
-                  <circle cx="12" cy="8" r="3.5" />
-                  <path d="M5 20a7 7 0 0 1 14 0" />
+                  <path d="M5 5h14a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-5l-4 3v-3H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z" />
                 </svg>
-                <span>Profile</span>
+                <span>AI Assistant</span>
               </span>
             </button>
           </div>
@@ -2436,12 +3530,14 @@ function App() {
           </>
         ) : (
           <section className="sidebar-info-card">
-            <h3>{activeView === 'git' ? 'Git' : activeView === 'profile' ? 'Profile' : 'Local'}</h3>
+            <h3>{activeView === 'git' ? 'Git' : activeView === 'profile' ? 'Profile' : activeView === 'chat' ? 'AI Assistant' : 'Local'}</h3>
             <p>
               {activeView === 'git'
                 ? 'Pull from GitHub and sync repositories.'
                 : activeView === 'profile'
                   ? 'Manage account security and cloud backup.'
+                  : activeView === 'chat'
+                    ? 'Ask questions and retrieve grounded context from your docs.'
                   : 'Manage local uploads and library storage.'}
             </p>
           </section>
@@ -2471,6 +3567,8 @@ function App() {
                   : 'Dashboard'
                 : activeView === 'git'
                   ? 'Git'
+                  : activeView === 'chat'
+                    ? 'AI Assistant'
                   : activeView === 'profile'
                     ? 'Profile'
                     : 'Local'}
@@ -2488,12 +3586,32 @@ function App() {
               </p>
             </div>
           ) : null}
+
+          <button
+            className={`topbar-profile-button ${activeView === 'profile' ? 'topbar-profile-button-active' : ''}`}
+            type="button"
+            onClick={() => setActiveView('profile')}
+            aria-label="Open profile"
+            title={githubLogin ? `Open @${githubLogin} profile` : 'Open profile'}
+          >
+            {githubUser?.user_metadata?.avatar_url ? (
+              <img
+                className="topbar-profile-avatar"
+                src={githubUser.user_metadata.avatar_url}
+                alt={githubLogin ? `${githubLogin} profile` : 'Profile'}
+              />
+            ) : (
+              <span className="topbar-profile-fallback" aria-hidden="true">
+                {String(githubLogin || githubUser?.email || 'P').charAt(0).toUpperCase()}
+              </span>
+            )}
+          </button>
         </header>
 
         {error ? <p className="error-banner">{error}</p> : null}
         {storageWarning ? <p className="storage-banner">{storageWarning}</p> : null}
 
-        <main className="document-panel" ref={documentPanelRef}>
+        <main className={`document-panel ${activeView === 'chat' ? 'document-panel-chat' : ''}`} ref={documentPanelRef}>
           {activeView === 'dashboard' ? (
             <>
               {selectedDoc ? (
@@ -2506,18 +3624,20 @@ function App() {
 
                   <div className="markdown-body">
                     {isPdfDoc(selectedDoc) ? (
-                      selectedPdfUrl ? (
-                        <iframe
-                          className="pdf-viewer"
-                          src={selectedPdfUrl}
-                          title={selectedDoc.title}
-                        />
+                      isPdfPageRendering ? (
+                        <p className="placeholder">Rendering PDF pages...</p>
+                      ) : pdfRenderError ? (
+                        <p className="placeholder">Could not render PDF preview: {pdfRenderError}</p>
+                      ) : selectedPdfPages.length ? (
+                        <div className="pdf-pages">
+                          {selectedPdfPages.map((pageImage, index) => (
+                            <img key={`${selectedDoc.id}-page-${index + 1}`} className="pdf-page-image" src={pageImage} alt={`Page ${index + 1}`} />
+                          ))}
+                        </div>
                       ) : selectedDoc.pdfBase64 ? (
                         <p className="placeholder">Loading PDF preview...</p>
                       ) : (
-                        <p className="placeholder">
-                          PDF binary is not available in this record. Re-import this PDF to open it in the PDF viewer.
-                        </p>
+                        <p className="placeholder">PDF binary is not available in this record. Re-import this PDF to open it.</p>
                       )
                     ) : (
                       <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
@@ -2544,7 +3664,6 @@ function App() {
                 <div className="sync-card-header">
                   <div>
                     <p className="eyebrow">Git</p>
-                    <h1>Manage Git Docs</h1>
                     <p className="sync-description">Pull from public repos and sync your docs.</p>
                   </div>
                 </div>
@@ -2665,13 +3784,139 @@ function App() {
             </>
           ) : null}
 
+          {activeView === 'chat' ? (
+            <>
+              <section className="sync-card chat-screen">
+                <div className="sync-card-header">
+                  <div>
+                    <h2 className="eyebrow">AI Assistant</h2>
+                    <p className="sync-description">Query your indexed knowledge base with section or library scope.</p>
+                    <div className="rag-status-strip" role="status" aria-live="polite">
+                      <span className={`rag-status-pill rag-status-pill-${ragIndexTone}`} title={ragIndexStatus}>
+                        Index
+                      </span>
+                      <span className={`rag-status-pill rag-status-pill-${ragEmbeddingTone}`} title={ragEmbeddingStatus}>
+                        Embeddings
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="sync-status-panel chat-shell" role="region" aria-label="Chat panel">
+                  <div className="chat-toolbar-row">
+                    <div className="chat-scope-row" role="tablist" aria-label="Chat retrieval scope">
+                      <button
+                        className="button"
+                        onClick={() => setChatScope('section')}
+                        disabled={isChatResponding || chatScope === 'section'}
+                      >
+                        Current section
+                      </button>
+                      <button
+                        className="button"
+                        onClick={() => setChatScope('all')}
+                        disabled={isChatResponding || chatScope === 'all'}
+                      >
+                        Library
+                      </button>
+                    </div>
+
+                    <button className="button chat-clear-btn" onClick={clearChatConversation} disabled={isChatResponding}>
+                      <svg className="chat-clear-icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M9 3h6l1 2h4v2H4V5h4l1-2zm1 6h2v8h-2V9zm4 0h2v8h-2V9zM7 9h2v8H7V9zm1 12h8a2 2 0 0 0 2-2V9H6v10a2 2 0 0 0 2 2z" />
+                      </svg>
+                      Clear chat
+                    </button>
+                  </div>
+
+                  <div className="chat-history" ref={chatHistoryRef} role="log" aria-live="polite" aria-label="Chat messages">
+                    <div className="chat-thread">
+                      {chatMessages.map((message) => (
+                        <div key={message.id} className={`chat-message-row ${message.role === 'user' ? 'chat-message-user' : 'chat-message-assistant'}`}>
+                          <div className="chat-message-card">
+                            <span className="chat-message-role">{message.role === 'user' ? 'You' : 'Assistant'}</span>
+                            <div className="chat-message-content">
+                              {message.role === 'assistant' ? (
+                                <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+                              ) : (
+                                <p>{message.content}</p>
+                              )}
+                            </div>
+
+                            {message.role === 'assistant' && Array.isArray(message.citations) && message.citations.length ? (
+                              <div className="chat-citations">
+                                <strong>Citations:</strong>
+                                <ul>
+                                  {message.citations.slice(0, 4).map((citation) => (
+                                    <li key={`${message.id}-${citation.chunkId}`}>
+                                      <button
+                                        type="button"
+                                        className="chat-citation-link"
+                                        onClick={() => {
+                                          if (!citation.docId) {
+                                            return
+                                          }
+
+                                          setActiveView('dashboard')
+                                          setSelectedDocId(citation.docId)
+                                        }}
+                                      >
+                                        {citation.title} ({citation.section}) - score {Number(citation.score || 0).toFixed(3)}
+                                      </button>
+                                    </li>
+                                  ))}
+                                </ul>
+                              </div>
+                            ) : null}
+                          </div>
+                        </div>
+                      ))}
+
+                      {isChatResponding ? (
+                        <div className="chat-message-row chat-message-assistant">
+                          <div className="chat-message-card chat-message-typing" aria-label="Assistant is typing">
+                            <span className="chat-message-role">Assistant</span>
+                            <div className="chat-typing-dots" aria-hidden="true">
+                              <span />
+                              <span />
+                              <span />
+                            </div>
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+
+                  <div className="chat-input-row">
+                    <input
+                      className="repo-input chat-input"
+                      type="text"
+                      placeholder="Ask a question about your docs"
+                      value={chatInput}
+                      onChange={(event) => setChatInput(event.target.value)}
+                      disabled={isChatResponding}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' && !event.shiftKey) {
+                          event.preventDefault()
+                          runChatWithRag()
+                        }
+                      }}
+                    />
+                    <button className="button button-primary" onClick={runChatWithRag} disabled={isChatResponding || !chatInput.trim()}>
+                      {isChatResponding ? 'Thinking...' : 'Send'}
+                    </button>
+                  </div>
+                </div>
+              </section>
+            </>
+          ) : null}
+
           {activeView === 'settings' ? (
             <>
               <section className="settings-card">
                 <div className="settings-card-header">
                   <div>
-                    <p className="eyebrow">Configuration</p>
-                    <h1>Local</h1>
+                    <h1 className="eyebrow">Local</h1>
                     <p className="settings-description">Manage your local library, import, and export tools.</p>
                   </div>
                 </div>
@@ -2867,11 +4112,11 @@ function App() {
           Local
         </button>
         <button
-          className={`mobile-bottom-link ${activeView === 'profile' ? 'mobile-bottom-link-active' : ''}`}
+          className={`mobile-bottom-link ${activeView === 'chat' ? 'mobile-bottom-link-active' : ''}`}
           type="button"
-          onClick={() => setActiveView('profile')}
+          onClick={() => setActiveView('chat')}
         >
-          Profile
+          Chat
         </button>
       </nav>
 
