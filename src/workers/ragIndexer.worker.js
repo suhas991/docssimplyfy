@@ -3,22 +3,8 @@ const APPROX_MAX_TOKENS = 520
 const APPROX_CHARS_PER_TOKEN = 4
 const MAX_CHARS_PER_CHUNK = APPROX_MAX_TOKENS * APPROX_CHARS_PER_TOKEN
 
-function isMarkdownLikeDoc(doc) {
-  const format = String(doc?.format || '').toLowerCase()
-  if (format === 'pdf') {
-    return false
-  }
-
-  if (format === 'markdown') {
-    return true
-  }
-
-  const hasContent = Boolean(String(doc?.content || '').trim())
-  if (!hasContent) {
-    return false
-  }
-
-  return !/\.pdf$/i.test(String(doc?.source || ''))
+function isIndexableDoc(doc) {
+  return Boolean(String(doc?.content || '').trim())
 }
 
 function normalizeWhitespace(value) {
@@ -172,11 +158,11 @@ self.onmessage = async (event) => {
   const docs = Array.isArray(payload.docs) ? payload.docs : []
 
   try {
-    const markdownDocs = docs.filter((doc) => isMarkdownLikeDoc(doc))
+    const indexableDocs = docs.filter((doc) => isIndexableDoc(doc))
     const chunks = []
 
-    for (let i = 0; i < markdownDocs.length; i += 1) {
-      const doc = markdownDocs[i]
+    for (let i = 0; i < indexableDocs.length; i += 1) {
+      const doc = indexableDocs[i]
       const docChunks = await createDocChunks(doc)
       chunks.push(...docChunks)
 
@@ -184,7 +170,7 @@ self.onmessage = async (event) => {
         type: 'index-progress',
         requestId,
         processedDocs: i + 1,
-        totalDocs: markdownDocs.length,
+        totalDocs: indexableDocs.length,
         chunkCount: chunks.length,
       })
     }
@@ -195,7 +181,7 @@ self.onmessage = async (event) => {
       chunks,
       meta: {
         chunkingVersion: CHUNKING_VERSION,
-        indexedDocCount: markdownDocs.length,
+        indexedDocCount: indexableDocs.length,
       },
     })
   } catch (error) {

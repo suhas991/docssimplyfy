@@ -31,6 +31,8 @@ const TOUR_DONE_KEY = 'docs-site.tour-done.v1'
 const TOUR_AUTO_SHOWN_KEY = 'docs-site.tour-auto-shown.v1'
 const DESKTOP_TOUR_DONE_KEY = 'docs-site.tour-desktop-done.v1'
 const MOBILE_TOUR_DONE_KEY = 'docs-site.tour-mobile-done.v1'
+const CHAT_MEMORY_STORAGE_KEY = 'docs-site.chat-memory.v1'
+const CHAT_MEMORY_MAX_MESSAGES = 24
 const BACKUP_REPO_NAME = 'docs-hub-backup'
 const BACKUP_REPO_FILE = 'docs-library-backup.json'
 const LIBRARY_DB_NAME = 'docs-site-db'
@@ -643,12 +645,13 @@ function buildLocalGroundedFallbackAnswer(question, chunks) {
   ].join('\n')
 }
 
-async function askGroqWithContext({ question, chunks }) {
+async function askGroqWithContext({ question, chunks, memoryMessages = [] }) {
   if (!GROQ_API_KEY) {
     return buildLocalGroundedFallbackAnswer(question, chunks)
   }
 
   const context = buildContextFromChunks(chunks, 6)
+  const memoryContext = buildChatMemoryContext(memoryMessages)
   const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -662,11 +665,11 @@ async function askGroqWithContext({ question, chunks }) {
         {
           role: 'system',
           content:
-            'You are a documentation assistant. Answer only using the provided context. If context is insufficient, say so clearly. Keep answers concise and include actionable points.',
+            'You are a documentation assistant with short-term conversation memory. Use the conversation memory and the provided context to answer. If context is insufficient, say so clearly. Keep answers concise and include actionable points.',
         },
         {
           role: 'user',
-          content: `Context:\n${context}\n\nQuestion:\n${question}`,
+          content: `Conversation memory:\n${memoryContext}\n\nContext:\n${context}\n\nQuestion:\n${question}`,
         },
       ],
     }),
@@ -771,6 +774,73 @@ function formatReadTimeFromWords(wordCount) {
   const wordsPerMinute = 220
   const minutes = Math.max(1, Math.ceil(wordCount / wordsPerMinute))
   return `${minutes} min read`
+}
+
+function getDefaultChatMessages() {
+  return [
+    {
+      id: createClientId(),
+      role: 'assistant',
+      content: 'I am ready. Ask me about your synced docs and I will answer using retrieved context.',
+      citations: [],
+    },
+  ]
+}
+
+function loadChatMessagesFromStorage() {
+  try {
+    const cached = localStorage.getItem(CHAT_MEMORY_STORAGE_KEY)
+    if (!cached) {
+      return getDefaultChatMessages()
+    }
+
+    const parsed = JSON.parse(cached)
+    if (!Array.isArray(parsed) || !parsed.length) {
+      return getDefaultChatMessages()
+    }
+
+    const sanitized = parsed
+      .filter((message) => message && (message.role === 'user' || message.role === 'assistant') && String(message.content || '').trim())
+      .slice(-CHAT_MEMORY_MAX_MESSAGES)
+      .map((message) => ({
+        id: String(message.id || createClientId()),
+        role: message.role,
+        content: String(message.content || ''),
+        citations: Array.isArray(message.citations) ? message.citations : [],
+      }))
+
+    return sanitized.length ? sanitized : getDefaultChatMessages()
+  } catch {
+    return getDefaultChatMessages()
+  }
+}
+
+function persistChatMessagesToStorage(messages) {
+  try {
+    const trimmed = Array.isArray(messages) ? messages.slice(-CHAT_MEMORY_MAX_MESSAGES) : []
+    localStorage.setItem(CHAT_MEMORY_STORAGE_KEY, JSON.stringify(trimmed))
+  } catch {
+    // Ignore storage failures; chat still works in-memory.
+  }
+}
+
+function buildChatMemoryContext(messages) {
+  const recentMessages = Array.isArray(messages)
+    ? messages
+        .filter((message) => message && (message.role === 'user' || message.role === 'assistant'))
+        .slice(-10)
+    : []
+
+  if (!recentMessages.length) {
+    return 'No prior conversation memory.'
+  }
+
+  return recentMessages
+    .map((message, index) => {
+      const speaker = message.role === 'user' ? 'User' : 'Assistant'
+      return `[${index + 1}] ${speaker}: ${String(message.content || '').trim()}`
+    })
+    .join('\n')
 }
 
 function normalizeView(value) {
@@ -1176,6 +1246,29 @@ async function renderPdfPagesToDataUrls(pdfBytes, targetWidth) {
   return pages
 }
 
+async function extractPdfTextFromBytes(pdfBytes) {
+  const pdfJs = await loadPdfJs()
+  const loadingTask = pdfJs.getDocument({ data: pdfBytes })
+  const pdf = await loadingTask.promise
+  const pages = []
+
+  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+    const page = await pdf.getPage(pageNumber)
+    const textContent = await page.getTextContent()
+    const pageText = (textContent.items || [])
+      .map((item) => (typeof item?.str === 'string' ? item.str : ''))
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+
+    if (pageText) {
+      pages.push(pageText)
+    }
+  }
+
+  return pages.join('\n\n').trim()
+}
+
 async function fetchGitHubBinaryFromDownloadUrl(downloadUrl, token) {
   if (!downloadUrl) {
     return null
@@ -1391,7 +1484,7 @@ async function fetchMarkdownDocsFromRepo({ owner, repo, token }) {
           throw new Error(`Failed to download ${entry.path}`)
         }
 
-        content = ''
+        content = await extractPdfTextFromBytes(pdfBytes)
         const pdfBase64 = encodeBytesToBase64(pdfBytes)
 
         return {
@@ -1635,14 +1728,7 @@ function App() {
   const [chatInput, setChatInput] = useState('')
   const [isChatResponding, setIsChatResponding] = useState(false)
   const [chatStatus, setChatStatus] = useState('Ask a question to start chatting with your docs.')
-  const [chatMessages, setChatMessages] = useState([
-    {
-      id: createClientId(),
-      role: 'assistant',
-      content: 'I am ready. Ask me about your synced docs and I will answer using retrieved context.',
-      citations: [],
-    },
-  ])
+  const [chatMessages, setChatMessages] = useState(() => loadChatMessagesFromStorage())
   const [readDocSources, setReadDocSources] = useState(() => {
     try {
       const cached = localStorage.getItem(READ_DOC_SOURCES_STORAGE_KEY)
@@ -1672,6 +1758,10 @@ function App() {
   const ragIndexRequestIdRef = useRef('')
   const documentPanelRef = useRef(null)
   const chatHistoryRef = useRef(null)
+
+  useEffect(() => {
+    persistChatMessagesToStorage(chatMessages)
+  }, [chatMessages])
 
   const isMobileSyncBarVisible = activeView === 'git' && gitSyncMode === 'repos' && Boolean(githubUser)
   const ragIndexTone = getRagStatusTone(ragIndexStatus)
@@ -1891,9 +1981,8 @@ function App() {
       window.clearTimeout(ragIndexTimeoutRef.current)
     }
 
-    const markdownDocs = library
+    const libraryDocs = library
       .flatMap((section) => section.docs || [])
-      .filter((doc) => isMarkdownLikeDoc(doc))
       .map((doc) => ({
         id: doc.id,
         title: doc.title,
@@ -1902,11 +1991,12 @@ function App() {
         sourceRepo: doc.sourceRepo,
         format: doc.format,
         content: doc.content,
+        pdfBase64: doc.pdfBase64,
       }))
 
-    if (!markdownDocs.length) {
-      setRagIndexStatus('Idle (no markdown docs to index)')
-      setRagEmbeddingStatus('Idle (no markdown docs)')
+    if (!libraryDocs.length) {
+      setRagIndexStatus('Idle (no docs to index)')
+      setRagEmbeddingStatus('Idle (no docs)')
       clearRagChunksFromIndexedDb().catch(() => {
         // Best-effort cleanup.
       })
@@ -1917,14 +2007,84 @@ function App() {
     }
 
     ragIndexTimeoutRef.current = window.setTimeout(() => {
-      const requestId = createClientId()
-      ragIndexRequestIdRef.current = requestId
       setRagIndexStatus('Preparing RAG index...')
-      ragIndexerWorkerRef.current?.postMessage({
-        type: 'index-library',
-        requestId,
-        docs: markdownDocs,
-      })
+
+      Promise.all(
+        libraryDocs.map(async (doc) => {
+          if (!isPdfDoc(doc)) {
+            return {
+              ...doc,
+              content: String(doc.content || ''),
+            }
+          }
+
+          const existing = String(doc.content || '').trim()
+          if (existing) {
+            return {
+              ...doc,
+              content: existing,
+            }
+          }
+
+          if (!doc.pdfBase64) {
+            return {
+              ...doc,
+              content: '',
+            }
+          }
+
+          try {
+            const pdfBytes = decodeBase64ToBytes(doc.pdfBase64)
+            const extractedText = await extractPdfTextFromBytes(pdfBytes)
+            return {
+              ...doc,
+              content: extractedText,
+            }
+          } catch {
+            return {
+              ...doc,
+              content: '',
+            }
+          }
+        }),
+      )
+        .then((docsWithContent) => {
+          const indexableDocs = docsWithContent
+            .filter((doc) => String(doc.content || '').trim())
+            .map((doc) => ({
+              id: doc.id,
+              title: doc.title,
+              section: doc.section,
+              source: doc.source,
+              sourceRepo: doc.sourceRepo,
+              format: doc.format,
+              content: doc.content,
+            }))
+
+          if (!indexableDocs.length) {
+            setRagIndexStatus('Idle (no indexable text found in docs)')
+            setRagEmbeddingStatus('Idle (no indexable text)')
+            clearRagChunksFromIndexedDb().catch(() => {
+              // Best-effort cleanup.
+            })
+            clearRagEmbeddingsFromIndexedDb().catch(() => {
+              // Best-effort cleanup.
+            })
+            return
+          }
+
+          const requestId = createClientId()
+          ragIndexRequestIdRef.current = requestId
+          ragIndexerWorkerRef.current?.postMessage({
+            type: 'index-library',
+            requestId,
+            docs: indexableDocs,
+          })
+        })
+        .catch(() => {
+          setRagIndexStatus('RAG indexing failed while preparing PDF text.')
+          setRagEmbeddingStatus('Idle')
+        })
     }, 600)
 
     return () => {
@@ -2491,6 +2651,8 @@ function App() {
           const content = await getFileContent(file)
 
           if (PDF_DOC_PATTERN.test(file.name)) {
+            const pdfBytes = new Uint8Array(await file.arrayBuffer())
+
             return {
               id: `${toSlug(file.name)}-${createClientId()}`,
               title: getTitleFromFile(file),
@@ -2499,8 +2661,8 @@ function App() {
               source: file.webkitRelativePath || file.name,
               format: 'pdf',
               mimeType: file.type || 'application/pdf',
-              pdfBase64: await getLocalPdfBase64(file),
-              content,
+              pdfBase64: encodeBytesToBase64(pdfBytes),
+              content: await extractPdfTextFromBytes(pdfBytes),
               updatedAt: new Date().toISOString(),
             }
           }
@@ -2894,7 +3056,8 @@ function App() {
       }
 
       setChatStatus('Generating grounded answer...')
-      const answer = await askGroqWithContext({ question, chunks: retrieval.results })
+      const memoryMessages = [...chatMessages, userMessage].slice(-CHAT_MEMORY_MAX_MESSAGES)
+      const answer = await askGroqWithContext({ question, chunks: retrieval.results, memoryMessages })
       const citations = retrieval.results.map((item) => ({
         chunkId: item.chunkId,
         docId: item.docId,
@@ -2930,14 +3093,16 @@ function App() {
   }
 
   const clearChatConversation = () => {
-    setChatMessages([
+    const resetMessages = [
       {
         id: createClientId(),
         role: 'assistant',
         content: 'Conversation reset. Ask a new question and I will use your indexed docs as context.',
         citations: [],
       },
-    ])
+    ]
+    setChatMessages(resetMessages)
+    persistChatMessagesToStorage(resetMessages)
     setChatStatus('Chat cleared.')
   }
 
