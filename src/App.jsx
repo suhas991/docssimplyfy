@@ -2,6 +2,7 @@ import { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { isSupabaseConfigured, supabase } from './lib/supabase'
+import { pullEmbeddingsFromGitHub, pushEmbeddingsToGitHub } from './lib/githubEmbeddingCache'
 import './App.css'
 
 const Joyride = lazy(() => import('react-joyride').then((module) => ({ default: module.Joyride })))
@@ -436,7 +437,7 @@ async function createEmbeddingVector(text) {
   return embedTextWithLocalMiniLm(text)
 }
 
-async function syncRagEmbeddingsFromChunks(chunks, onProgress) {
+async function syncRagEmbeddingsFromChunks(chunks, onProgress, githubOwner = null, githubRepo = BACKUP_REPO_NAME) {
   const model = getEmbeddingModelName()
   const allExisting = await readAllRagEmbeddingsFromIndexedDb()
 
@@ -444,6 +445,25 @@ async function syncRagEmbeddingsFromChunks(chunks, onProgress) {
   for (const record of allExisting) {
     if (record?.model === model && record?.modelHash) {
       existingByModelHash.set(record.modelHash, record)
+    }
+  }
+
+  // Try to pull embeddings from GitHub cache if owner is provided
+  let githubCached = []
+  if (githubOwner) {
+    try {
+      const { embeddings: cached } = await pullEmbeddingsFromGitHub(githubOwner, githubRepo)
+      githubCached = Array.isArray(cached) ? cached : []
+
+      // Add GitHub cached embeddings to existing map
+      for (const emb of githubCached) {
+        if (emb?.model === model && emb?.modelHash && !existingByModelHash.has(emb.modelHash)) {
+          existingByModelHash.set(emb.modelHash, emb)
+        }
+      }
+    } catch (error) {
+      console.warn('Failed to pull embeddings from GitHub cache:', error)
+      // Continue without GitHub cache
     }
   }
 
@@ -456,14 +476,35 @@ async function syncRagEmbeddingsFromChunks(chunks, onProgress) {
   }
 
   if (!missing.length) {
-    await writeRagEmbeddingsToIndexedDb([], {
-      model,
-      embeddedChunkCount: chunks.length,
-      pendingChunkCount: 0,
-    })
+    // Update IndexedDB with any newly downloaded GitHub embeddings
+    const newFromGitHub = githubCached.filter(
+      (emb) => emb?.model === model && !allExisting.some((e) => e.modelHash === emb.modelHash),
+    )
+
+    if (newFromGitHub.length) {
+      await writeRagEmbeddingsToIndexedDb(newFromGitHub, {
+        model,
+        embeddedChunkCount: chunks.length,
+        pendingChunkCount: 0,
+        source: 'github-cache',
+      })
+    } else {
+      await writeRagEmbeddingsToIndexedDb([], {
+        model,
+        embeddedChunkCount: chunks.length,
+        pendingChunkCount: 0,
+      })
+    }
 
     if (onProgress) {
-      onProgress({ processed: chunks.length, total: chunks.length, created: 0, reused: chunks.length, model })
+      onProgress({
+        processed: chunks.length,
+        total: chunks.length,
+        created: 0,
+        reused: chunks.length,
+        model,
+        fromGitHub: newFromGitHub.length,
+      })
     }
 
     return {
@@ -471,11 +512,13 @@ async function syncRagEmbeddingsFromChunks(chunks, onProgress) {
       reused: chunks.length,
       total: chunks.length,
       model,
+      fromGitHub: newFromGitHub.length,
     }
   }
 
   const recordsToFlush = []
   let created = 0
+  let fromGitHub = 0
   const reused = chunks.length - missing.length
 
   for (let index = 0; index < missing.length; index += 1) {
@@ -499,18 +542,19 @@ async function syncRagEmbeddingsFromChunks(chunks, onProgress) {
       const batch = recordsToFlush.splice(0, recordsToFlush.length)
       await writeRagEmbeddingsToIndexedDb(batch, {
         model,
-        embeddedChunkCount: reused + created,
+        embeddedChunkCount: reused + created + fromGitHub,
         pendingChunkCount: missing.length - (index + 1),
       })
     }
 
     if (onProgress) {
       onProgress({
-        processed: reused + created,
+        processed: reused + created + fromGitHub,
         total: chunks.length,
         created,
         reused,
         model,
+        fromGitHub,
       })
     }
   }
@@ -523,11 +567,28 @@ async function syncRagEmbeddingsFromChunks(chunks, onProgress) {
     })
   }
 
+  // Push new embeddings to GitHub for cross-device reuse
+  if (created > 0 && githubOwner) {
+    try {
+      const allEmbeddings = await readAllRagEmbeddingsFromIndexedDb()
+      await pushEmbeddingsToGitHub(allEmbeddings, githubOwner, githubRepo, {
+        model,
+        totalEmbeddings: allEmbeddings.length,
+        newCount: created,
+        syncTimestamp: new Date().toISOString(),
+      })
+    } catch (error) {
+      console.warn('Failed to push embeddings to GitHub:', error)
+      // Continue even if GitHub push fails
+    }
+  }
+
   return {
     created,
     reused,
     total: chunks.length,
     model,
+    fromGitHub,
   }
 }
 
@@ -1855,9 +1916,13 @@ function App() {
 
             try {
               setRagEmbeddingStatus('Preparing embeddings...')
-              const result = await syncRagEmbeddingsFromChunks(chunks, ({ processed, total, model }) => {
-                setRagEmbeddingStatus(`Embedding ${processed}/${total} chunks (${model})...`)
-              })
+              const result = await syncRagEmbeddingsFromChunks(
+                chunks,
+                ({ processed, total, model }) => {
+                  setRagEmbeddingStatus(`Embedding ${processed}/${total} chunks (${model})...`)
+                },
+                githubLogin,
+              )
 
               setRagEmbeddingStatus(`Ready (${result.total} chunks, ${result.created} new, model: ${result.model})`)
             } catch {
@@ -1940,6 +2005,57 @@ function App() {
       cancelled = true
     }
   }, [])
+
+  // Initialize GitHub embedding cache when user logs in
+  useEffect(() => {
+    if (!githubLogin || !hasHydratedLibrary) {
+      return
+    }
+
+    let cancelled = false
+
+    const initializeGitHubEmbeddingCache = async () => {
+      try {
+        const { embeddings: cachedEmbeddings } = await pullEmbeddingsFromGitHub(githubLogin, BACKUP_REPO_NAME)
+
+        if (cancelled) {
+          return
+        }
+
+        if (Array.isArray(cachedEmbeddings) && cachedEmbeddings.length > 0) {
+          // Get existing embeddings from IndexedDB
+          const existing = await readAllRagEmbeddingsFromIndexedDb()
+          const existingMap = new Map(existing.map((e) => [e.modelHash, e]))
+
+          // Merge with priority to local (newer) if they exist
+          for (const emb of cachedEmbeddings) {
+            if (emb?.modelHash && !existingMap.has(emb.modelHash)) {
+              existingMap.set(emb.modelHash, emb)
+            }
+          }
+
+          // Write merged embeddings back to IndexedDB
+          const merged = Array.from(existingMap.values())
+          if (merged.length > 0) {
+            await writeRagEmbeddingsToIndexedDb(merged, {
+              source: 'github-sync',
+              syncTimestamp: new Date().toISOString(),
+              cachedFromGitHub: cachedEmbeddings.length,
+            })
+          }
+        }
+      } catch (error) {
+        console.warn('Failed to initialize GitHub embedding cache:', error)
+        // Non-blocking - continue even if GitHub sync fails
+      }
+    }
+
+    initializeGitHubEmbeddingCache()
+
+    return () => {
+      cancelled = true
+    }
+  }, [githubLogin, hasHydratedLibrary])
 
   useEffect(() => {
     if (!hasHydratedLibrary) {
@@ -3028,9 +3144,13 @@ function App() {
 
       if (!hasScopedEmbeddings) {
         setChatStatus(`Preparing embeddings for ${effectiveChunks.length} chunks...`)
-        const embedResult = await syncRagEmbeddingsFromChunks(effectiveChunks, ({ processed, total, model }) => {
-          setChatStatus(`Embedding ${processed}/${total} chunks (${model})...`)
-        })
+        const embedResult = await syncRagEmbeddingsFromChunks(
+          effectiveChunks,
+          ({ processed, total, model }) => {
+            setChatStatus(`Embedding ${processed}/${total} chunks (${model})...`)
+          },
+          githubLogin,
+        )
         setRagEmbeddingStatus(`Ready (${embedResult.total} chunks, ${embedResult.created} new, model: ${embedResult.model})`)
       }
 
